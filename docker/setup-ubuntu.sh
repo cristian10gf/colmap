@@ -56,6 +56,11 @@ echo "📦 Configure Docker"
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 
+if ! command -v jq >/dev/null 2>&1; then
+    echo "📦 Installing jq (required for Docker Hub API parsing)..."
+    sudo apt-get install -y jq
+fi
+
 echo "🔍 Finding latest patch version for CUDA $COMPATIBLE_CUDA..."
 AVAILABLE_VERSIONS=$(curl -s "https://registry.hub.docker.com/v2/repositories/nvidia/cuda/tags/?page_size=100" | jq -r '.results[].name' | grep -E "^${COMPATIBLE_CUDA}\.[0-9]+-base-ubuntu24\.04$" | head -1)
 if [ -n "$AVAILABLE_VERSIONS" ]; then
