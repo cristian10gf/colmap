@@ -17,6 +17,7 @@ set -euo pipefail
 #   --no-single-camera   : Estimate separate intrinsics per image
 #   --camera-model MODEL : Camera model (default: SIMPLE_RADIAL)
 #   --cpu                : Force CPU mode (no GPU)
+#   --dsp                : Enable DSP-SIFT (better features, but CPU-only extraction, 10-30x slower)
 #
 # Example (full run):
 #   ./run-advance.sh ./south-building/
@@ -51,6 +52,7 @@ OVERLAP=20                 # overlap for sequential matcher
 SINGLE_CAMERA=1            # all frames share intrinsics (same camera/video)
 CAMERA_MODEL="SIMPLE_RADIAL"
 FORCE_CPU=0
+DSP_SIFT=0                 # DSP-SIFT: better features but forces CPU extraction (10-30x slower)
 
 HOST_DIR=$(realpath "$1")
 shift
@@ -69,6 +71,7 @@ while [[ $# -gt 0 ]]; do
         --no-single-camera) SINGLE_CAMERA=0;      shift   ;;
         --camera-model)     CAMERA_MODEL="$2";    shift 2 ;;
         --cpu)              FORCE_CPU=1;          shift   ;;
+        --dsp)              DSP_SIFT=1;           shift   ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -119,6 +122,7 @@ echo "  GPU              : $USE_GPU"
 echo "  Matcher          : $MATCHER"
 echo "  Camera model     : $CAMERA_MODEL"
 echo "  Single camera    : $SINGLE_CAMERA"
+echo "  DSP-SIFT         : $DSP_SIFT"
 [ "$MATCHER" = "sequential" ] && echo "  Overlap          : $OVERLAP"
 [ -n "$SKIP_TO" ] && echo "  Resuming from    : $SKIP_TO"
 [ "$RUN_DENSE" -eq 0 ] && echo "  Dense            : SKIPPED"
@@ -192,9 +196,17 @@ if should_run "extraction"; then
         --SiftExtraction.max_image_size "${MAX_IMAGE_SIZE}"
         --SiftExtraction.max_num_features "${MAX_FEATURES}"
         --SiftExtraction.first_octave -1
-        --SiftExtraction.domain_size_pooling 1
-        --SiftExtraction.estimate_affine_shape 1
     )
+
+    # domain_size_pooling and estimate_affine_shape produce better features
+    # but FORCE CPU-only extraction (10-30x slower). Only enable via flag.
+    if [ "${DSP_SIFT:-0}" -eq 1 ]; then
+        EXTRACT_ARGS+=(
+            --SiftExtraction.domain_size_pooling 1
+            --SiftExtraction.estimate_affine_shape 1
+        )
+        echo "   DSP-SIFT enabled (CPU extraction, slower but better features)"
+    fi
 
     if [ "$USE_GPU" -eq 1 ]; then
         EXTRACT_ARGS+=(--SiftExtraction.gpu_index 0)
