@@ -182,10 +182,16 @@ if [ "$MODE" = "advanced" ]; then
     echo "Serie        : $SERIES_DIR"
     echo "Imagenes     : $IMAGES_DIR"
     echo "Modo         : advanced"
+
+    ADV_ARGS=("$SERIES_DIR")
+    if [ "$FORCE_CPU" -eq 1 ]; then
+        ADV_ARGS+=(--cpu)
+    fi
     if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
+        ADV_ARGS+=("${EXTRA_ARGS[@]}")
         echo "Args extra   : ${EXTRA_ARGS[*]}"
     fi
-    exec "${SCRIPT_DIR}/run-advance.sh" "$SERIES_DIR" "${EXTRA_ARGS[@]}"
+    exec "${SCRIPT_DIR}/run-advance.sh" "${ADV_ARGS[@]}"
 fi
 
 COLMAP_IMAGE=$(select_colmap_image)
