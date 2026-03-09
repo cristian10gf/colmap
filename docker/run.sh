@@ -27,15 +27,26 @@ DOCKER_ARGS=(
     -w /working
 )
 
-echo "Testing for GPU acceleration..."
-if docker run --rm --gpus all "$COLMAP_IMAGE" nvidia-smi >/dev/null 2>&1; then
-    echo "GPU detected (--gpus all)."
-    DOCKER_ARGS+=(--gpus all -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=compute,utility)
-elif docker run --rm --runtime=nvidia "$COLMAP_IMAGE" nvidia-smi >/dev/null 2>&1; then
-    echo "GPU detected (--runtime=nvidia)."
-    DOCKER_ARGS+=(--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=compute,utility)
+echo "Detectando GPU NVIDIA..."
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "WARN: nvidia-smi no encontrado en el host. Ejecutando en modo CPU."
 else
-    echo "GPU not detected. Using CPU mode."
+    echo "GPU del host:"
+    nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader 2>/dev/null \
+        | while IFS= read -r line; do echo "  $line"; done
+
+    if docker run --rm --gpus all "$COLMAP_IMAGE" nvidia-smi >/dev/null 2>&1; then
+        echo "GPU Docker   : OK (--gpus all)"
+        DOCKER_ARGS+=(--gpus all -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics)
+    elif docker run --rm --runtime=nvidia "$COLMAP_IMAGE" nvidia-smi >/dev/null 2>&1; then
+        echo "GPU Docker   : OK (--runtime=nvidia)"
+        DOCKER_ARGS+=(--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics)
+    else
+        echo "ERROR: nvidia-smi funciona en el host pero Docker no puede acceder a la GPU." >&2
+        echo "  Verifica que nvidia-container-toolkit este instalado:" >&2
+        echo "    sudo apt install nvidia-container-toolkit && sudo systemctl restart docker" >&2
+        exit 1
+    fi
 fi
 
 echo "Starting interactive bash shell..."
