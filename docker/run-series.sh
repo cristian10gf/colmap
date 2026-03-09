@@ -140,23 +140,41 @@ configure_gpu_args() {
     USE_GPU=0
 
     if [ "$FORCE_CPU" -eq 1 ]; then
+        echo "GPU          : desactivada (--cpu)"
         return
     fi
+
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "WARN: nvidia-smi no encontrado en el host. Ejecutando en modo CPU." >&2
+        return
+    fi
+
+    echo "GPU del host:"
+    nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader 2>/dev/null \
+        | while IFS= read -r line; do echo "  $line"; done
 
     if docker run --rm --gpus all "$image" nvidia-smi >/dev/null 2>&1; then
         GPU_ARGS+=(--gpus all)
         GPU_ARGS+=(-e NVIDIA_VISIBLE_DEVICES=all)
-        GPU_ARGS+=(-e NVIDIA_DRIVER_CAPABILITIES=compute,utility)
+        GPU_ARGS+=(-e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics)
         USE_GPU=1
+        echo "GPU Docker   : OK (--gpus all)"
         return
     fi
 
     if docker run --rm --runtime=nvidia "$image" nvidia-smi >/dev/null 2>&1; then
         GPU_ARGS+=(--runtime=nvidia)
         GPU_ARGS+=(-e NVIDIA_VISIBLE_DEVICES=all)
-        GPU_ARGS+=(-e NVIDIA_DRIVER_CAPABILITIES=compute,utility)
+        GPU_ARGS+=(-e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics)
         USE_GPU=1
+        echo "GPU Docker   : OK (--runtime=nvidia)"
+        return
     fi
+
+    echo "ERROR: nvidia-smi funciona en el host pero Docker no puede acceder a la GPU." >&2
+    echo "  Verifica que nvidia-container-toolkit este instalado:" >&2
+    echo "    sudo apt install nvidia-container-toolkit && sudo systemctl restart docker" >&2
+    exit 1
 }
 
 run_with_docker_hint() {
