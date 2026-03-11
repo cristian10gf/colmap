@@ -53,6 +53,7 @@ SINGLE_CAMERA=1            # all frames share intrinsics (same camera/video)
 CAMERA_MODEL="SIMPLE_RADIAL"
 FORCE_CPU=0
 DSP_SIFT=0                 # DSP-SIFT: better features but forces CPU extraction (10-30x slower)
+NUM_CPUS_OVERRIDE=""         # override nproc with --cpus N
 
 HOST_DIR=$(realpath "$1")
 shift
@@ -71,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --no-single-camera) SINGLE_CAMERA=0;      shift   ;;
         --camera-model)     CAMERA_MODEL="$2";    shift 2 ;;
         --cpu)              FORCE_CPU=1;          shift   ;;
+        --cpus)             NUM_CPUS_OVERRIDE="$2"; shift 2 ;;
         --dsp)              DSP_SIFT=1;           shift   ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
@@ -94,7 +96,11 @@ else
     COLMAP_IMAGE="colmap/colmap:latest"
 fi
 
-NUM_CPUS=$(nproc)
+if [ -n "$NUM_CPUS_OVERRIDE" ]; then
+    NUM_CPUS="$NUM_CPUS_OVERRIDE"
+else
+    NUM_CPUS=$(nproc)
+fi
 
 # --- GPU Detection ---
 GPU_ARGS=()
@@ -207,8 +213,8 @@ if should_run "extraction"; then
         --image_path ./images
         --ImageReader.camera_model "$CAMERA_MODEL"
         --ImageReader.single_camera "$SINGLE_CAMERA"
-        --SiftExtraction.use_gpu "$USE_GPU"
-        --SiftExtraction.max_image_size "${MAX_IMAGE_SIZE}"
+        --FeatureExtraction.use_gpu "$USE_GPU"
+        --FeatureExtraction.max_image_size "${MAX_IMAGE_SIZE}"
         --SiftExtraction.max_num_features "${MAX_FEATURES}"
         --SiftExtraction.first_octave -1
     )
@@ -224,7 +230,7 @@ if should_run "extraction"; then
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        EXTRACT_ARGS+=(--SiftExtraction.gpu_index 0)
+        EXTRACT_ARGS+=(--FeatureExtraction.gpu_index 0)
     fi
 
     run_colmap feature_extractor "${EXTRACT_ARGS[@]}"
@@ -239,13 +245,13 @@ if should_run "matching"; then
     echo "[2/5] Feature Matching (${MATCHER})..."
     MATCH_BASE_ARGS=(
         --database_path ./database.db
-        --SiftMatching.use_gpu "$USE_GPU"
+        --FeatureMatching.use_gpu "$USE_GPU"
         --SiftMatching.max_ratio 0.8
-        --SiftMatching.max_num_matches "${MAX_MATCHES}"
+        --FeatureMatching.max_num_matches "${MAX_MATCHES}"
     )
 
     if [ "$USE_GPU" -eq 1 ]; then
-        MATCH_BASE_ARGS+=(--SiftMatching.gpu_index 0)
+        MATCH_BASE_ARGS+=(--FeatureMatching.gpu_index 0)
     fi
 
     if [ "$MATCHER" = "sequential" ]; then

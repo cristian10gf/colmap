@@ -17,6 +17,7 @@ Opciones:
   --data-root PATH            Carpeta base de datasets
   --force-context-default     Ejecuta "docker context use default" antes de correr
   --cpu                       Fuerza ejecucion sin GPU
+  --cpus N                    Numero de CPUs para Docker (default: todos)
   -h, --help                  Muestra esta ayuda
 
 Ejemplos:
@@ -32,6 +33,7 @@ DATA_ROOT="${PROJECT_ROOT}/preprocesamiento/data"
 MODE="automatic"
 FORCE_CPU=0
 FORCE_CONTEXT_DEFAULT=0
+NUM_CPUS_OVERRIDE=""
 SERIES=""
 EXTRA_ARGS=()
 
@@ -61,6 +63,10 @@ while [[ $# -gt 0 ]]; do
         --cpu)
             FORCE_CPU=1
             shift
+            ;;
+        --cpus)
+            NUM_CPUS_OVERRIDE="$2"
+            shift 2
             ;;
         --)
             shift
@@ -205,6 +211,9 @@ if [ "$MODE" = "advanced" ]; then
     if [ "$FORCE_CPU" -eq 1 ]; then
         ADV_ARGS+=(--cpu)
     fi
+    if [ -n "$NUM_CPUS_OVERRIDE" ]; then
+        ADV_ARGS+=(--cpus "$NUM_CPUS_OVERRIDE")
+    fi
     if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
         ADV_ARGS+=("${EXTRA_ARGS[@]}")
         echo "Args extra   : ${EXTRA_ARGS[*]}"
@@ -215,7 +224,11 @@ fi
 COLMAP_IMAGE=$(select_colmap_image)
 configure_gpu_args "$COLMAP_IMAGE"
 
-NUM_CPUS=$(nproc)
+if [ -n "$NUM_CPUS_OVERRIDE" ]; then
+    NUM_CPUS="$NUM_CPUS_OVERRIDE"
+else
+    NUM_CPUS=$(nproc)
+fi
 DOCKER_ARGS=(
     --rm
     -v "${SERIES_DIR}:/working"
