@@ -10,7 +10,7 @@ Asume la estructura:
 
 Modos:
   --mode automatic   Ejecuta automatic_reconstructor (por defecto)
-  --mode advanced    Reutiliza run-advance.sh para control fino
+  --mode advanced    Reutiliza run-advance.sh para control fino (recomendado para >500 imagenes)
   --mode shell       Abre una shell dentro del contenedor
 
 Opciones:
@@ -18,10 +18,16 @@ Opciones:
   --force-context-default     Ejecuta "docker context use default" antes de correr
   --cpu                       Fuerza ejecucion sin GPU
   --cpus N                    Numero de CPUs para Docker (default: todos)
+  --hier                      Usa mapper jerarquico en modo automatic (mejor para >500 imagenes)
   -h, --help                  Muestra esta ayuda
+
+NOTA: Para control total de GPU en Bundle Adjustment y reducir BA global periodico,
+      usa --mode advanced. El modo automatic solo expone opciones de alto nivel.
 
 Ejemplos:
   ./run-series.sh edificio-a
+  ./run-series.sh edificio-a --hier
+  ./run-series.sh edificio-a --mode advanced
   ./run-series.sh edificio-a --mode advanced -- --max-image-size 4000 --cache-size 16
   ./run-series.sh edificio-a --mode shell
 EOF
@@ -36,6 +42,7 @@ FORCE_CONTEXT_DEFAULT=0
 NUM_CPUS_OVERRIDE=""
 SERIES=""
 EXTRA_ARGS=()
+MAP_TYPE="incremental"  # hierarchical is better for >500 images (use --hier)
 
 if [ $# -eq 0 ]; then
     usage
@@ -67,6 +74,10 @@ while [[ $# -gt 0 ]]; do
         --cpus)
             NUM_CPUS_OVERRIDE="$2"
             shift 2
+            ;;
+        --hier)
+            MAP_TYPE="hierarchical"
+            shift
             ;;
         --)
             shift
@@ -242,28 +253,23 @@ if [ ${#GPU_ARGS[@]} -gt 0 ]; then
     DOCKER_ARGS+=("${GPU_ARGS[@]}")
 fi
 
+# automatic_reconstructor solo acepta opciones de alto nivel:
+#   --use_gpu, --gpu_index, --num_threads, --mapper {incremental,hierarchical,global}
+# Los parametros --Mapper.ba_* (BA global, GPU solver, etc.) NO son accesibles desde aqui.
+# Para control total de BA y priorizacion GPU, usa --mode advanced.
 AUTO_ARGS=(
     automatic_reconstructor
     --image_path ./images
     --workspace_path .
     --use_gpu "$USE_GPU"
+    --num_threads "$NUM_CPUS"
+    --mapper "$MAP_TYPE"
 )
 
-# GPU Bundle Adjustment: activates CUDA Ceres solver, avoids dense CPU Cholesky
-# that fails repeatedly with >500 images (levenberg_marquardt Cholesky errors).
+# GPU index para extraccion y matching (lo que SÍ acepta automatic_reconstructor con GPU).
 if [ "$USE_GPU" -eq 1 ]; then
-    AUTO_ARGS+=(--Mapper.ba_use_gpu 1)
+    AUTO_ARGS+=(--gpu_index -1)  # -1 = todas las GPUs disponibles
 fi
-
-# Reduce global BA frequency (COLMAP default 1.1 = every 10% new images is too aggressive
-# for large datasets). 1.4 = every 40% → ~3x fewer global BA rounds, much less CPU time.
-AUTO_ARGS+=(
-    --Mapper.ba_global_images_ratio 1.4
-    --Mapper.ba_global_points_ratio 1.4
-    --Mapper.ba_global_max_num_iterations 30
-    --Mapper.ba_global_ignore_redundant_points3D 1
-    --Mapper.num_threads -1
-)
 
 if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
     AUTO_ARGS+=("${EXTRA_ARGS[@]}")
@@ -271,10 +277,11 @@ fi
 
 echo "Serie        : $SERIES_DIR"
 echo "Imagenes     : $IMAGES_DIR"
-echo "Modo         : automatic"
-echo "GPU          : $USE_GPU"
+echo "Modo         : automatic (mapper=${MAP_TYPE})"
+echo "GPU          : $USE_GPU (extraccion + matching; BA=CPU)"
 echo "CPUs         : $NUM_CPUS"
 echo "Resultados   : $SERIES_DIR"
+[ "$MAP_TYPE" = "incremental" ] && echo "NOTA         : Para conjuntos >500 imagenes considera --hier o --mode advanced"
 echo ""
 
 run_with_docker_hint docker run "${DOCKER_ARGS[@]}" "$COLMAP_IMAGE" colmap "${AUTO_ARGS[@]}"
