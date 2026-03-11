@@ -87,8 +87,8 @@ RUN cd /colmap && \
         -DBLA_VENDOR=Intel10_64lp && \
     ninja install
 
-# Collect SuiteSparse runtime libraries needed by Ceres into the install tree.
-RUN for lib in cholmod amd camd ccolamd colamd suitesparseconfig; do \
+# Collect SuiteSparse runtime libraries needed by Ceres/COLMAP into the install tree.
+RUN for lib in cholmod amd camd ccolamd colamd suitesparseconfig spqr cxsparse btf klu umfpack; do \
         cp -a /usr/lib/x86_64-linux-gnu/lib${lib}*.so* /colmap-install/lib/ 2>/dev/null || true; \
     done
 
