@@ -318,7 +318,7 @@ if should_run "sparse"; then
         --image_path ./images
         --output_path ./sparse
         # --- BA frequency: reduce from default 1.1 to avoid repeated Cholesky failures ---
-        --Mapper.ba_global_images_ratio "${BA_GLOBAL_FRAMES_RATIO}"
+        --Mapper.ba_global_frames_ratio "${BA_GLOBAL_FRAMES_RATIO}"
         --Mapper.ba_global_points_ratio "${BA_GLOBAL_POINTS_RATIO}"
         --Mapper.ba_global_max_num_iterations "${BA_GLOBAL_MAX_ITER}"
         # --- Prune redundant 3D points before each BA round (reduces problem size) ---
