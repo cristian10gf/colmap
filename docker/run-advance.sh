@@ -18,6 +18,11 @@ set -euo pipefail
 #   --camera-model MODEL : Camera model (default: SIMPLE_RADIAL)
 #   --cpu                : Force CPU mode (no GPU)
 #   --dsp                : Enable DSP-SIFT (better features, but CPU-only extraction, 10-30x slower)
+#   --ba-global-ratio N  : Global BA trigger ratio (default: 1.4; COLMAP default: 1.1 = every 10%)
+#                          1.4 = every 40% of new images → ~3x less global BA rounds
+#   --ba-max-iter N      : Max iterations per global BA round (default: 30; COLMAP default: 50)
+#   --fast-dense         : Fast dense mode: geom_consistency=0, filter=1, samples=7, iters=3, window_step=2
+#                          ~4-5x faster than default dense, moderate quality loss
 #
 # Example (full run):
 #   ./run-advance.sh ./south-building/
@@ -48,12 +53,21 @@ RUN_DENSE=1
 OVERWRITE=1
 MESHER="poisson"
 MATCHER="sequential"       # sequential (best for video) | exhaustive | vocab_tree
-OVERLAP=20                 # overlap for sequential matcher
+OVERLAP=10                 # overlap for sequential matcher (10 sufficient for 2 FPS video; was 20)
 SINGLE_CAMERA=1            # all frames share intrinsics (same camera/video)
 CAMERA_MODEL="SIMPLE_RADIAL"
 FORCE_CPU=0
 DSP_SIFT=0                 # DSP-SIFT: better features but forces CPU extraction (10-30x slower)
 NUM_CPUS_OVERRIDE=""         # override nproc with --cpus N
+
+# --- Bundle Adjustment (Mapper) ---
+# COLMAP default for ba_global_*_ratio is 1.1 (triggers global BA every 10% new images/points).
+# With 1800 images this causes ~16 global BA rounds, each failing with dense Cholesky on CPU.
+# Fix: use GPU solver (ba_use_gpu) + reduce frequency (ratio 1.4 = every 40% = ~4 rounds).
+BA_GLOBAL_FRAMES_RATIO=1.4   # COLMAP default: 1.1
+BA_GLOBAL_POINTS_RATIO=1.4   # COLMAP default: 1.1
+BA_GLOBAL_MAX_ITER=30        # COLMAP default: 50 — fewer iterations per global BA round
+FAST_DENSE=0                 # 0=quality dense (default) | 1=fast dense (~4-5x faster)
 
 HOST_DIR=$(realpath "$1")
 shift
@@ -74,6 +88,9 @@ while [[ $# -gt 0 ]]; do
         --cpu)              FORCE_CPU=1;          shift   ;;
         --cpus)             NUM_CPUS_OVERRIDE="$2"; shift 2 ;;
         --dsp)              DSP_SIFT=1;           shift   ;;
+        --ba-global-ratio)  BA_GLOBAL_FRAMES_RATIO="$2"; BA_GLOBAL_POINTS_RATIO="$2"; shift 2 ;;
+        --ba-max-iter)      BA_GLOBAL_MAX_ITER="$2";                                  shift 2 ;;
+        --fast-dense)       FAST_DENSE=1;                                              shift   ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -145,8 +162,12 @@ echo "  Camera model     : $CAMERA_MODEL"
 echo "  Single camera    : $SINGLE_CAMERA"
 echo "  DSP-SIFT         : $DSP_SIFT"
 [ "$MATCHER" = "sequential" ] && echo "  Overlap          : $OVERLAP"
-[ -n "$SKIP_TO" ] && echo "  Resuming from    : $SKIP_TO"
-[ "$RUN_DENSE" -eq 0 ] && echo "  Dense            : SKIPPED"
+  echo "  BA global ratio  : ${BA_GLOBAL_FRAMES_RATIO} (COLMAP default: 1.1)"
+  echo "  BA max iters     : ${BA_GLOBAL_MAX_ITER} (COLMAP default: 50)"
+  [ -n "$SKIP_TO" ] && echo "  Resuming from    : $SKIP_TO"
+  [ "$RUN_DENSE" -eq 0 ] && echo "  Dense            : SKIPPED"
+  [ "$RUN_DENSE" -eq 1 ] && [ "$FAST_DENSE" -eq 1 ] && echo "  Dense mode       : FAST (geom_consistency=0 filter=1 samples=7 iters=3 step=2)"
+  [ "$RUN_DENSE" -eq 1 ] && [ "$FAST_DENSE" -eq 0 ] && echo "  Dense mode       : QUALITY (geom_consistency=1 samples=15 iters=5)"
 [ "$OVERWRITE" -eq 1 ] && echo "  Overwrite        : YES (--no-overwrite to skip)"
 echo "======================================================="
 
@@ -259,7 +280,7 @@ if should_run "matching"; then
             "${MATCH_BASE_ARGS[@]}" \
             --SequentialMatching.overlap "${OVERLAP}" \
             --SequentialMatching.loop_detection 1 \
-            --SequentialMatching.loop_detection_num_images 50
+            --SequentialMatching.loop_detection_num_images 30
     elif [ "$MATCHER" = "vocab_tree" ]; then
         VOCAB_TREE="/working/vocab_tree.bin"
         if [ ! -f "${HOST_DIR}/vocab_tree.bin" ]; then
@@ -289,10 +310,44 @@ fi
 if should_run "sparse"; then
     echo ""
     echo "[3/5] Sparse Reconstruction (SfM)..."
-    run_colmap mapper \
-        --database_path ./database.db \
-        --image_path ./images \
+    echo "   BA global ratio  : ${BA_GLOBAL_FRAMES_RATIO}  |  BA max iters: ${BA_GLOBAL_MAX_ITER}"
+    [ "$USE_GPU" -eq 1 ] && echo "   BA GPU solver    : ON (--Mapper.ba_use_gpu 1)"
+
+    MAPPER_ARGS=(
+        --database_path ./database.db
+        --image_path ./images
         --output_path ./sparse
+        # --- BA frequency: reduce from default 1.1 to avoid repeated Cholesky failures ---
+        --Mapper.ba_global_images_ratio "${BA_GLOBAL_FRAMES_RATIO}"
+        --Mapper.ba_global_points_ratio "${BA_GLOBAL_POINTS_RATIO}"
+        --Mapper.ba_global_max_num_iterations "${BA_GLOBAL_MAX_ITER}"
+        # --- Prune redundant 3D points before each BA round (reduces problem size) ---
+        --Mapper.ba_global_ignore_redundant_points3D 1
+        # --- Use all CPU threads for triangulation/registration ---
+        --Mapper.num_threads -1
+    )
+
+    # GPU Bundle Adjustment: activates CUDA Ceres solver (cuSolver/cuDSS).
+    # Avoids the dense CPU Cholesky path that fails with >500 images.
+    # Requires Ceres built with USE_CUDA=ON (already done in local Dockerfile).
+    if [ "$USE_GPU" -eq 1 ]; then
+        MAPPER_ARGS+=(
+            --Mapper.ba_use_gpu 1
+        )
+    fi
+
+    # With single camera (all frames share intrinsics), focal length and distortion
+    # are well-determined after the first few BA rounds. Skipping per-round refinement
+    # saves significant BA time without quality loss.
+    if [ "$SINGLE_CAMERA" -eq 1 ]; then
+        MAPPER_ARGS+=(
+            --Mapper.ba_refine_focal_length 0
+            --Mapper.ba_refine_extra_params 0
+        )
+        echo "   Intrinsics       : fixed during BA (single camera mode)"
+    fi
+
+    run_colmap mapper "${MAPPER_ARGS[@]}"
     echo "Sparse reconstruction done."
 fi
 
@@ -323,18 +378,36 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
         --output_path ./dense/0 \
         --output_type COLMAP
 
-    DENSE_ARGS=(
-        --workspace_path ./dense/0
-        --workspace_format COLMAP
-        --PatchMatchStereo.max_image_size "${MAX_IMAGE_SIZE}"
-        --PatchMatchStereo.cache_size "${CACHE_SIZE}"
-        --PatchMatchStereo.num_samples 15
-        --PatchMatchStereo.num_iterations 5
-        --PatchMatchStereo.geom_consistency 1
-    )
+    if [ "$FAST_DENSE" -eq 1 ]; then
+        # Fast mode: skip geometric consistency pass (~50% savings),
+        # reduce samples (15→7) and iterations (5→3), double window step.
+        # Quality impact: moderate. Suitable for OneFormer3D segmentation input.
+        DENSE_ARGS=(
+            --workspace_path ./dense/0
+            --workspace_format COLMAP
+            --PatchMatchStereo.max_image_size "${MAX_IMAGE_SIZE}"
+            --PatchMatchStereo.cache_size "${CACHE_SIZE}"
+            --PatchMatchStereo.num_samples 7
+            --PatchMatchStereo.num_iterations 3
+            --PatchMatchStereo.geom_consistency 0
+            --PatchMatchStereo.filter 1
+            --PatchMatchStereo.window_step 2
+        )
+    else
+        # Quality mode (default): full geometric consistency, suitable for precise meshes.
+        DENSE_ARGS=(
+            --workspace_path ./dense/0
+            --workspace_format COLMAP
+            --PatchMatchStereo.max_image_size "${MAX_IMAGE_SIZE}"
+            --PatchMatchStereo.cache_size "${CACHE_SIZE}"
+            --PatchMatchStereo.num_samples 15
+            --PatchMatchStereo.num_iterations 5
+            --PatchMatchStereo.geom_consistency 1
+        )
+    fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0)
+        DENSE_ARGS+=(--PatchMatchStereo.gpu_index -1)  # -1 = use ALL available GPUs
     fi
 
     run_colmap patch_match_stereo "${DENSE_ARGS[@]}"

@@ -249,6 +249,22 @@ AUTO_ARGS=(
     --use_gpu "$USE_GPU"
 )
 
+# GPU Bundle Adjustment: activates CUDA Ceres solver, avoids dense CPU Cholesky
+# that fails repeatedly with >500 images (levenberg_marquardt Cholesky errors).
+if [ "$USE_GPU" -eq 1 ]; then
+    AUTO_ARGS+=(--Mapper.ba_use_gpu 1)
+fi
+
+# Reduce global BA frequency (COLMAP default 1.1 = every 10% new images is too aggressive
+# for large datasets). 1.4 = every 40% → ~3x fewer global BA rounds, much less CPU time.
+AUTO_ARGS+=(
+    --Mapper.ba_global_images_ratio 1.4
+    --Mapper.ba_global_points_ratio 1.4
+    --Mapper.ba_global_max_num_iterations 30
+    --Mapper.ba_global_ignore_redundant_points3D 1
+    --Mapper.num_threads -1
+)
+
 if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
     AUTO_ARGS+=("${EXTRA_ARGS[@]}")
 fi
