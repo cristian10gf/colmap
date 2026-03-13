@@ -13,7 +13,8 @@ set -euo pipefail
 #   --overlap N          : Sequential matcher overlap (default: 20)
 #   --skip-to STAGE      : Resume from stage (extraction|matching|sparse|dense|fusion)
 #   --no-dense           : Skip dense reconstruction
-#   --mesher TYPE        : poisson (default) or delaunay
+#   --mesh               : Enable mesh generation after stereo_fusion (default: disabled)
+#   --mesher TYPE        : Mesher type when --mesh is enabled: poisson (default) or delaunay
 #   --no-single-camera   : Estimate separate intrinsics per image
 #   --camera-model MODEL : Camera model (default: SIMPLE_RADIAL)
 #   --cpu                : Force CPU mode (no GPU)
@@ -37,7 +38,7 @@ if [ $# -eq 0 ]; then
     echo "Usage: $0 <host_directory> [--cache-size 16] [--max-image-size 3200]"
     echo "       [--max-features 8192] [--max-matches 32768]"
     echo "       [--skip-to extraction|matching|sparse|dense|fusion]"
-    echo "       [--no-dense] [--mesher poisson|delaunay]"
+    echo "       [--no-dense] [--mesh] [--mesher poisson|delaunay]"
     echo "       [--matcher sequential|exhaustive|vocab_tree]"
     echo "       [--no-single-camera] [--camera-model SIMPLE_RADIAL] [--cpu]"
     exit 1
@@ -50,12 +51,13 @@ MAX_FEATURES=8192          # SIFT features per image
 MAX_MATCHES=32768          # matches per image pair
 SKIP_TO=""                 # resume from this stage
 RUN_DENSE=1
+RUN_MESH=0
 OVERWRITE=1
 MESHER="poisson"
 MATCHER="sequential"       # sequential (best for video) | exhaustive | vocab_tree
-OVERLAP=10                 # overlap for sequential matcher (10 sufficient for 2 FPS video; was 20)
+OVERLAP=20                 # overlap for sequential matcher (10 sufficient for 2 FPS video; was 20)
 SINGLE_CAMERA=1            # all frames share intrinsics (same camera/video)
-CAMERA_MODEL="SIMPLE_RADIAL"
+CAMERA_MODEL="OPENCV"  # COLMAP camera model (default: SIMPLE_RADIAL, good for most smartphone cameras; use OPENCV for more complex lenses)
 FORCE_CPU=0
 DSP_SIFT=0                 # DSP-SIFT: better features but forces CPU extraction (10-30x slower)
 NUM_CPUS_OVERRIDE=""         # override nproc with --cpus N
@@ -63,10 +65,10 @@ NUM_CPUS_OVERRIDE=""         # override nproc with --cpus N
 # --- Bundle Adjustment (Mapper) ---
 # COLMAP default for ba_global_*_ratio is 1.1 (triggers global BA every 10% new images/points).
 # With 1800 images this causes ~16 global BA rounds, each failing with dense Cholesky on CPU.
-# Fix: use GPU solver (ba_use_gpu) + reduce frequency (ratio 1.4 = every 40% = ~4 rounds).
-BA_GLOBAL_FRAMES_RATIO=1.4   # COLMAP default: 1.1
-BA_GLOBAL_POINTS_RATIO=1.4   # COLMAP default: 1.1
-BA_GLOBAL_MAX_ITER=30        # COLMAP default: 50 — fewer iterations per global BA round
+# Fix: use GPU solver (ba_use_gpu) + reduce frequency (ratio 1.1 = every 10% = ~16 rounds).
+BA_GLOBAL_FRAMES_RATIO=1.1   # COLMAP default: 1.1
+BA_GLOBAL_POINTS_RATIO=1.1   # COLMAP default: 1.1
+BA_GLOBAL_MAX_ITER=50        # COLMAP default: 50 — fewer iterations per global BA round
 FAST_DENSE=0                 # 0=quality dense (default) | 1=fast dense (~4-5x faster)
 
 HOST_DIR=$(realpath "$1")
@@ -79,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --max-matches)      MAX_MATCHES="$2";     shift 2 ;;
         --skip-to)          SKIP_TO="$2";         shift 2 ;;
         --no-dense)         RUN_DENSE=0;          shift   ;;
+        --mesh)             RUN_MESH=1;           shift   ;;
         --no-overwrite)     OVERWRITE=0;          shift   ;;
         --mesher)           MESHER="$2";          shift 2 ;;
         --matcher)          MATCHER="$2";         shift 2 ;;
@@ -94,6 +97,11 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
+
+if [ "$RUN_DENSE" -eq 0 ] && [ "$RUN_MESH" -eq 1 ]; then
+    echo "WARN: --mesh ignored because --no-dense was set."
+    RUN_MESH=0
+fi
 
 if [ ! -d "$HOST_DIR" ]; then
     echo "Error: Directory '$HOST_DIR' does not exist."
@@ -164,6 +172,8 @@ echo "  DSP-SIFT         : $DSP_SIFT"
 [ "$MATCHER" = "sequential" ] && echo "  Overlap          : $OVERLAP"
   echo "  BA global ratio  : ${BA_GLOBAL_FRAMES_RATIO} (COLMAP default: 1.1)"
   echo "  BA max iters     : ${BA_GLOBAL_MAX_ITER} (COLMAP default: 50)"
+    [ "$RUN_MESH" -eq 1 ] && echo "  Mesh generation  : ENABLED (${MESHER})"
+    [ "$RUN_MESH" -eq 0 ] && echo "  Mesh generation  : DISABLED (--mesh to enable)"
   [ -n "$SKIP_TO" ] && echo "  Resuming from    : $SKIP_TO"
   [ "$RUN_DENSE" -eq 0 ] && echo "  Dense            : SKIPPED"
   [ "$RUN_DENSE" -eq 1 ] && [ "$FAST_DENSE" -eq 1 ] && echo "  Dense mode       : FAST (geom_consistency=0 filter=1 samples=7 iters=3 step=2)"
@@ -238,6 +248,10 @@ if should_run "extraction"; then
         --FeatureExtraction.max_image_size "${MAX_IMAGE_SIZE}"
         --SiftExtraction.max_num_features "${MAX_FEATURES}"
         --SiftExtraction.first_octave -1
+        --SiftExtraction.num_octaves 4
+        --SiftExtraction.octave_resolution 4
+        --SiftExtraction.peak_threshold 0.004
+        --SiftExtraction.edge_threshold 10
     )
 
     # domain_size_pooling and estimate_affine_shape produce better features
@@ -269,6 +283,10 @@ if should_run "matching"; then
         --FeatureMatching.use_gpu "$USE_GPU"
         --SiftMatching.max_ratio 0.8
         --FeatureMatching.max_num_matches "${MAX_MATCHES}"
+        --SiftMatching.cross_check 1
+        --SiftMatching.guided_matching 1
+        --TwoViewGeometry.min_num_inliers 20
+        --ExhaustiveMatching.block_size 150
     )
 
     if [ "$USE_GPU" -eq 1 ]; then
@@ -325,6 +343,9 @@ if should_run "sparse"; then
         --Mapper.ba_global_ignore_redundant_points3D 1
         # --- Use all CPU threads for triangulation/registration ---
         --Mapper.num_threads -1
+        --Mapper.init_min_tri_angle 8
+        --Mapper.tri_min_angle 1.5
+        --Mapper.ba_local_num_images 8
     )
 
     # GPU Bundle Adjustment: activates CUDA Ceres solver (cuSolver/cuDSS).
@@ -333,6 +354,7 @@ if should_run "sparse"; then
     if [ "$USE_GPU" -eq 1 ]; then
         MAPPER_ARGS+=(
             --Mapper.ba_use_gpu 1
+            --Mapper.ba_refine_principal_point 1
         )
     fi
 
@@ -372,6 +394,12 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
     echo "   VRAM cache: ${CACHE_SIZE}GB  |  Max image: ${MAX_IMAGE_SIZE}px"
     echo "   Using sparse model: $BEST_SPARSE_REL"
 
+    # Re-running dense with existing outputs can make image_undistorter fail
+    # (stale files / mixed ownership from previous Docker runs).
+    # Keep this cleanup scoped to dense workspace only.
+    docker run "${DOCKER_BASE[@]}" "${COLMAP_IMAGE}" \
+        bash -lc "rm -rf /working/dense/0/images /working/dense/0/sparse /working/dense/0/stereo /working/dense/0/normal_maps /working/dense/0/depth_maps /working/dense/0/consistency_graphs"
+
     run_colmap image_undistorter \
         --image_path ./images \
         --input_path "$BEST_SPARSE_REL" \
@@ -407,7 +435,7 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        DENSE_ARGS+=(--PatchMatchStereo.gpu_index -1)  # -1 = use ALL available GPUs
+        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0)  # -1 = use ALL available GPUs
     fi
 
     run_colmap patch_match_stereo "${DENSE_ARGS[@]}"
@@ -419,25 +447,31 @@ fi
 # =============================================
 if [ "$RUN_DENSE" -eq 1 ] && should_run "fusion"; then
     echo ""
-    echo "[5/5] Stereo Fusion + Meshing (${MESHER})..."
+    echo "[5/5] Stereo Fusion..."
 
     run_colmap stereo_fusion \
         --workspace_path ./dense/0 \
         --workspace_format COLMAP \
         --input_type geometric \
-        --output_path ./dense/0/fused.ply
+        --output_path ./dense/0/fused.ply \
+        --StereoFusion.num_threads 12
 
-    if [ "$MESHER" = "poisson" ]; then
-        run_colmap poisson_mesher \
-            --input_path ./dense/0/fused.ply \
-            --output_path ./dense/0/meshed-poisson.ply
+    if [ "$RUN_MESH" -eq 1 ]; then
+        echo "   Meshing enabled (${MESHER})..."
+        if [ "$MESHER" = "poisson" ]; then
+            run_colmap poisson_mesher \
+                --input_path ./dense/0/fused.ply \
+                --output_path ./dense/0/meshed-poisson.ply
+        else
+            run_colmap delaunay_mesher \
+                --input_path ./dense/0 \
+                --input_type dense \
+                --output_path ./dense/0/meshed-delaunay.ply
+        fi
+        echo "Fusion and meshing done."
     else
-        run_colmap delaunay_mesher \
-            --input_path ./dense/0 \
-            --input_type dense \
-            --output_path ./dense/0/meshed-delaunay.ply
+        echo "Fusion done. Meshing skipped (--mesh to enable)."
     fi
-    echo "Fusion and meshing done."
 fi
 
 echo ""
@@ -445,5 +479,5 @@ echo "======================================================="
 echo "Pipeline complete!"
 echo "   Sparse model : $BEST_SPARSE/"
 [ "$RUN_DENSE" -eq 1 ] && echo "   Dense cloud  : $HOST_DIR/dense/0/fused.ply"
-[ "$RUN_DENSE" -eq 1 ] && echo "   Mesh          : $HOST_DIR/dense/0/meshed-${MESHER}.ply"
+[ "$RUN_DENSE" -eq 1 ] && [ "$RUN_MESH" -eq 1 ] && echo "   Mesh          : $HOST_DIR/dense/0/meshed-${MESHER}.ply"
 echo "======================================================="
