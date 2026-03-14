@@ -47,29 +47,40 @@ RUN apt-get update && \
         libsuitesparse-dev \
         libcurl4-openssl-dev \
         libssl-dev \
-        libmkl-full-dev
+        libmkl-full-dev \
+        git
 
 # Fix issue in Ubuntu's openimageio CMake config.
 # We don't depend on any of openimageio's OpenCV functionality,
 # but it still requires the OpenCV include directory to exist.
 RUN mkdir -p /usr/include/opencv4
 
+# ── cuDSS: solver matricial disperso en GPU (requerido por Ceres 2.3 para GPU BA)
+# El repositorio de NVIDIA ya está presente en la imagen base nvidia/cuda,
+# por lo que libcudss-dev puede instalarse directamente.
+# Si falla (el paquete no está en el repo), fallback al .deb manual abajo.
+RUN apt-get install -y libcudss-dev
+
 # Build Ceres Solver from source with CUDA/cuSOLVER for GPU bundle adjustment.
-ARG CERES_VERSION=2.2.0
-RUN wget -qO- https://github.com/ceres-solver/ceres-solver/archive/refs/tags/${CERES_VERSION}.tar.gz \
-        | tar xz -C /tmp && \
-    cd /tmp/ceres-solver-${CERES_VERSION} && \
+# Usamos la rama ceres-2.3 del repo oficial. Esta rama tiene soporte cuDSS.
+# --depth 1 evita descargar todo el historial y reduce tiempo de build.
+RUN git clone --depth 1 --branch ceres-2.3 \
+        https://github.com/ceres-solver/ceres-solver.git /tmp/ceres-solver && \
+    cd /tmp/ceres-solver && \
     mkdir build && cd build && \
     cmake .. -GNinja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/colmap-install \
         -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
         -DUSE_CUDA=ON \
+        # Con cuDSS instalado en el sistema, cmake lo detecta automáticamente.
+        # Verifica en la salida del build: DEBE aparecer "found cuDSS" o
+        # "cuDSS found at /usr/lib/...". Si no aparece, el GPU BA no funcionará.
         -DBUILD_TESTING=OFF \
         -DBUILD_EXAMPLES=OFF \
         -DBUILD_BENCHMARKS=OFF && \
     ninja install && \
-    rm -rf /tmp/ceres-solver-${CERES_VERSION}
+    rm -rf /tmp/ceres-solver
 
 # Copy source into the image.
 COPY . /colmap
@@ -131,6 +142,7 @@ RUN apt-get update && \
         libmkl-intel-lp64 \
         libmkl-intel-thread \
         libmkl-core && \
+        libcudss0 &&
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

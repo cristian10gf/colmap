@@ -355,6 +355,9 @@ if should_run "sparse"; then
         MAPPER_ARGS+=(
             --Mapper.ba_use_gpu 1
             --Mapper.ba_refine_principal_point 1
+            --BundleAdjustmentCeres.min_num_images_gpu_solver 20  # Threshold mínimo de imágenes para activar el solver GPU
+            --BundleAdjustmentCeres.max_num_images_direct_dense_gpu_solver 100 # Hasta este número de imágenes usa "direct dense" (cuDSS dense)
+            --BundleAdjustmentCeres.max_num_images_direct_sparse_gpu_solver 500 # Hasta este número usa "direct sparse" (cuDSS sparse, el más eficiente)
         )
     fi
 
