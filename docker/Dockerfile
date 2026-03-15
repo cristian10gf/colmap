@@ -141,7 +141,7 @@ RUN apt-get update && \
         libmkl-locale \
         libmkl-intel-lp64 \
         libmkl-intel-thread \
-        libmkl-core && \
+        libmkl-core \
         libcudss0 &&
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*

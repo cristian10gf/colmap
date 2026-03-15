@@ -24,6 +24,14 @@ set -euo pipefail
 #   --ba-max-iter N      : Max iterations per global BA round (default: 30; COLMAP default: 50)
 #   --fast-dense         : Fast dense mode: geom_consistency=0, filter=1, samples=7, iters=3, window_step=2
 #                          ~4-5x faster than default dense, moderate quality loss
+#   --depth-min M        : Fallback min depth [m] for PatchMatchStereo (default: -1 = auto from sparse).
+#                          Set explicitly (e.g. 0.1) when some images have no visible sparse points and
+#                          patch_match_stereo crashes with "depth_min > 0" check failure.
+#   --depth-max M        : Fallback max depth [m] for PatchMatchStereo (default: -1 = auto from sparse).
+#                          Set explicitly (e.g. 100.0) together with --depth-min.
+#   --resume-dense       : Skip dense cleanup and image_undistorter; go straight to patch_match_stereo.
+#                          Use together with --skip-to dense to resume a crashed PatchMatchStereo run
+#                          without losing already-computed depth maps.
 #
 # Example (full run):
 #   ./run-advance.sh ./south-building/
@@ -70,6 +78,9 @@ BA_GLOBAL_FRAMES_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_POINTS_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_MAX_ITER=50        # COLMAP default: 50 — fewer iterations per global BA round
 FAST_DENSE=0                 # 0=quality dense (default) | 1=fast dense (~4-5x faster)
+DEPTH_MIN=0.1                 # -1 = auto from sparse; set >0 as fallback for images with no sparse points
+DEPTH_MAX=-100                 # -1 = auto from sparse; set >0 as fallback
+RESUME_DENSE=0               # 1 = skip cleanup+undistorter, go straight to patch_match_stereo
 
 HOST_DIR=$(realpath "$1")
 shift
@@ -94,6 +105,9 @@ while [[ $# -gt 0 ]]; do
         --ba-global-ratio)  BA_GLOBAL_FRAMES_RATIO="$2"; BA_GLOBAL_POINTS_RATIO="$2"; shift 2 ;;
         --ba-max-iter)      BA_GLOBAL_MAX_ITER="$2";                                  shift 2 ;;
         --fast-dense)       FAST_DENSE=1;                                              shift   ;;
+        --depth-min)        DEPTH_MIN="$2";                                            shift 2 ;;
+        --depth-max)        DEPTH_MAX="$2";                                            shift 2 ;;
+        --resume-dense)     RESUME_DENSE=1;                                            shift   ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -178,6 +192,8 @@ echo "  DSP-SIFT         : $DSP_SIFT"
   [ "$RUN_DENSE" -eq 0 ] && echo "  Dense            : SKIPPED"
   [ "$RUN_DENSE" -eq 1 ] && [ "$FAST_DENSE" -eq 1 ] && echo "  Dense mode       : FAST (geom_consistency=0 filter=1 samples=7 iters=3 step=2)"
   [ "$RUN_DENSE" -eq 1 ] && [ "$FAST_DENSE" -eq 0 ] && echo "  Dense mode       : QUALITY (geom_consistency=1 samples=15 iters=5)"
+  [ "$RUN_DENSE" -eq 1 ] && [ "$DEPTH_MIN" != "-1" ] && echo "  Depth bounds     : min=${DEPTH_MIN}m max=${DEPTH_MAX}m (fallback for images with no sparse points)"
+  [ "$RUN_DENSE" -eq 1 ] && [ "$RESUME_DENSE" -eq 1 ] && echo "  Resume dense     : YES (skipping cleanup + undistorter)"
 [ "$OVERWRITE" -eq 1 ] && echo "  Overwrite        : YES (--no-overwrite to skip)"
 echo "======================================================="
 
@@ -284,9 +300,9 @@ if should_run "matching"; then
         --SiftMatching.max_ratio 0.8
         --FeatureMatching.max_num_matches "${MAX_MATCHES}"
         --SiftMatching.cross_check 1
-        --SiftMatching.guided_matching 1
+        #--SiftMatching.guided_matching 1
         --TwoViewGeometry.min_num_inliers 20
-        --ExhaustiveMatching.block_size 150
+        #--ExhaustiveMatching.block_size 150
     )
 
     if [ "$USE_GPU" -eq 1 ]; then
@@ -355,9 +371,6 @@ if should_run "sparse"; then
         MAPPER_ARGS+=(
             --Mapper.ba_use_gpu 1
             --Mapper.ba_refine_principal_point 1
-            --BundleAdjustmentCeres.min_num_images_gpu_solver 20  # Threshold mínimo de imágenes para activar el solver GPU
-            --BundleAdjustmentCeres.max_num_images_direct_dense_gpu_solver 100 # Hasta este número de imágenes usa "direct dense" (cuDSS dense)
-            --BundleAdjustmentCeres.max_num_images_direct_sparse_gpu_solver 500 # Hasta este número usa "direct sparse" (cuDSS sparse, el más eficiente)
         )
     fi
 
@@ -397,17 +410,22 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
     echo "   VRAM cache: ${CACHE_SIZE}GB  |  Max image: ${MAX_IMAGE_SIZE}px"
     echo "   Using sparse model: $BEST_SPARSE_REL"
 
-    # Re-running dense with existing outputs can make image_undistorter fail
-    # (stale files / mixed ownership from previous Docker runs).
-    # Keep this cleanup scoped to dense workspace only.
-    docker run "${DOCKER_BASE[@]}" "${COLMAP_IMAGE}" \
-        bash -lc "rm -rf /working/dense/0/images /working/dense/0/sparse /working/dense/0/stereo /working/dense/0/normal_maps /working/dense/0/depth_maps /working/dense/0/consistency_graphs"
+    if [ "$RESUME_DENSE" -eq 1 ]; then
+        echo "   Resume mode: skipping cleanup and image_undistorter."
+        echo "   Existing depth maps in dense/0/stereo/depth_maps/ will be reused."
+    else
+        # Re-running dense with existing outputs can make image_undistorter fail
+        # (stale files / mixed ownership from previous Docker runs).
+        # Keep this cleanup scoped to dense workspace only.
+        docker run "${DOCKER_BASE[@]}" "${COLMAP_IMAGE}" \
+            bash -lc "rm -rf /working/dense/0/images /working/dense/0/sparse /working/dense/0/stereo /working/dense/0/normal_maps /working/dense/0/depth_maps /working/dense/0/consistency_graphs"
 
-    run_colmap image_undistorter \
-        --image_path ./images \
-        --input_path "$BEST_SPARSE_REL" \
-        --output_path ./dense/0 \
-        --output_type COLMAP
+        run_colmap image_undistorter \
+            --image_path ./images \
+            --input_path "$BEST_SPARSE_REL" \
+            --output_path ./dense/0 \
+            --output_type COLMAP
+    fi
 
     if [ "$FAST_DENSE" -eq 1 ]; then
         # Fast mode: skip geometric consistency pass (~50% savings),
@@ -439,6 +457,16 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
 
     if [ "$USE_GPU" -eq 1 ]; then
         DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0)  # -1 = use ALL available GPUs
+    fi
+
+    # Fallback depth bounds: required when some images have no visible sparse points.
+    # Without these, PatchMatchStereo crashes with "depth_min > 0 && depth_max > 0" check failure.
+    # -1 (default) means auto-estimate from sparse model per image.
+    if [ "$DEPTH_MIN" != "-1" ]; then
+        DENSE_ARGS+=(--PatchMatchStereo.depth_min "${DEPTH_MIN}")
+    fi
+    if [ "$DEPTH_MAX" != "-1" ]; then
+        DENSE_ARGS+=(--PatchMatchStereo.depth_max "${DEPTH_MAX}")
     fi
 
     run_colmap patch_match_stereo "${DENSE_ARGS[@]}"
