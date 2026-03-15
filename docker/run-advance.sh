@@ -213,7 +213,7 @@ DOCKER_BASE=(
     --rm
     --cpus="${NUM_CPUS}"
     --ipc=host
-    --shm-size=16g
+    --shm-size=32g
     --ulimit memlock=-1
     --ulimit stack=67108864
     -v "${HOST_DIR}:/working"
