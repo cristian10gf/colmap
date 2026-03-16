@@ -68,7 +68,7 @@ MESHER="poisson"
 MATCHER="sequential"       # sequential (best for video) | exhaustive | vocab_tree
 OVERLAP=20                 # overlap for sequential matcher (10 sufficient for 2 FPS video; was 20)
 SINGLE_CAMERA=1            # all frames share intrinsics (same camera/video)
-CAMERA_MODEL="OPENCV"  # COLMAP camera model (default: SIMPLE_RADIAL, good for most smartphone cameras; use OPENCV for more complex lenses)
+CAMERA_MODEL="SIMPLE_RADIAL"  # COLMAP camera model (default: SIMPLE_RADIAL, good for most smartphone cameras; use OPENCV for more complex lenses)
 FORCE_CPU=0
 DSP_SIFT=0                 # DSP-SIFT: better features but forces CPU extraction (10-30x slower)
 NUM_CPUS_OVERRIDE=""         # override nproc with --cpus N
@@ -81,8 +81,8 @@ BA_GLOBAL_FRAMES_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_POINTS_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_MAX_ITER=50        # COLMAP default: 50 — fewer iterations per global BA round
 FAST_DENSE=0                 # 0=quality dense (default) | 1=fast dense (~4-5x faster)
-DEPTH_MIN=-1                 # -1 = auto from sparse; set >0 as fallback for images with no sparse points
-DEPTH_MAX=-1                 # -1 = auto from sparse; set >0 as fallback
+DEPTH_MIN=-0                 # -1 = auto from sparse; set >0 as fallback for images with no sparse points
+DEPTH_MAX=100                 # -1 = auto from sparse; set >0 as fallback
 RESUME_DENSE=0               # 1 = skip cleanup+undistorter, go straight to patch_match_stereo
 FUSION_USE_CACHE=1          # 1 = stream depth maps in chunks (required when RAM < ~50GB for large datasets)
 FUSION_CACHE_SIZE=32         # GB of RAM for fusion streaming cache (only used when FUSION_USE_CACHE=1)
