@@ -32,6 +32,9 @@ set -euo pipefail
 #   --resume-dense       : Skip dense cleanup and image_undistorter; go straight to patch_match_stereo.
 #                          Use together with --skip-to dense to resume a crashed PatchMatchStereo run
 #                          without losing already-computed depth maps.
+#   --fusion-use-cache   : Enable StereoFusion streaming cache (use_cache=1). Required when RAM < total
+#                          size of all depth+normal maps (~50GB for 3143 images). Prevents OOM.
+#   --fusion-cache-size N: RAM (GB) for fusion streaming cache (default: 32). Only used with --fusion-use-cache.
 #
 # Example (full run):
 #   ./run-advance.sh ./south-building/
@@ -78,9 +81,11 @@ BA_GLOBAL_FRAMES_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_POINTS_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_MAX_ITER=50        # COLMAP default: 50 — fewer iterations per global BA round
 FAST_DENSE=0                 # 0=quality dense (default) | 1=fast dense (~4-5x faster)
-DEPTH_MIN=0.1                 # -1 = auto from sparse; set >0 as fallback for images with no sparse points
-DEPTH_MAX=-100                 # -1 = auto from sparse; set >0 as fallback
+DEPTH_MIN=-1                 # -1 = auto from sparse; set >0 as fallback for images with no sparse points
+DEPTH_MAX=-1                 # -1 = auto from sparse; set >0 as fallback
 RESUME_DENSE=0               # 1 = skip cleanup+undistorter, go straight to patch_match_stereo
+FUSION_USE_CACHE=1          # 1 = stream depth maps in chunks (required when RAM < ~50GB for large datasets)
+FUSION_CACHE_SIZE=32         # GB of RAM for fusion streaming cache (only used when FUSION_USE_CACHE=1)
 
 HOST_DIR=$(realpath "$1")
 shift
@@ -108,6 +113,8 @@ while [[ $# -gt 0 ]]; do
         --depth-min)        DEPTH_MIN="$2";                                            shift 2 ;;
         --depth-max)        DEPTH_MAX="$2";                                            shift 2 ;;
         --resume-dense)     RESUME_DENSE=1;                                            shift   ;;
+        --fusion-use-cache) FUSION_USE_CACHE=1;                                        shift   ;;
+        --fusion-cache-size) FUSION_CACHE_SIZE="$2";                                   shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -281,7 +288,7 @@ if should_run "extraction"; then
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        EXTRACT_ARGS+=(--FeatureExtraction.gpu_index 0)
+        EXTRACT_ARGS+=(--FeatureExtraction.gpu_index 0,0,0)
     fi
 
     run_colmap feature_extractor "${EXTRACT_ARGS[@]}"
@@ -306,7 +313,7 @@ if should_run "matching"; then
     )
 
     if [ "$USE_GPU" -eq 1 ]; then
-        MATCH_BASE_ARGS+=(--FeatureMatching.gpu_index 0)
+        MATCH_BASE_ARGS+=(--FeatureMatching.gpu_index 0,0,0,0)
     fi
 
     if [ "$MATCHER" = "sequential" ]; then
@@ -456,7 +463,7 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0)  # -1 = use ALL available GPUs
+        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0,0,0)  # -1 = use ALL available GPUs
     fi
 
     # Fallback depth bounds: required when some images have no visible sparse points.
@@ -480,12 +487,22 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "fusion"; then
     echo ""
     echo "[5/5] Stereo Fusion..."
 
-    run_colmap stereo_fusion \
-        --workspace_path ./dense/0 \
-        --workspace_format COLMAP \
-        --input_type geometric \
-        --output_path ./dense/0/fused.ply \
+    FUSION_ARGS=(
+        --workspace_path ./dense/0
+        --workspace_format COLMAP
+        --input_type geometric
+        --output_path ./dense/0/fused.ply
         --StereoFusion.num_threads 12
+    )
+    if [ "$FUSION_USE_CACHE" -eq 1 ]; then
+        FUSION_ARGS+=(
+            --StereoFusion.use_cache 1
+            --StereoFusion.cache_size "${FUSION_CACHE_SIZE}"
+        )
+        echo "   Fusion cache     : ON (${FUSION_CACHE_SIZE}GB RAM streaming)"
+    fi
+
+    run_colmap stereo_fusion "${FUSION_ARGS[@]}"
 
     if [ "$RUN_MESH" -eq 1 ]; then
         echo "   Meshing enabled (${MESHER})..."
