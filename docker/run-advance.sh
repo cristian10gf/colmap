@@ -81,7 +81,7 @@ BA_GLOBAL_FRAMES_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_POINTS_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_MAX_ITER=50        # COLMAP default: 50 — fewer iterations per global BA round
 FAST_DENSE=0                 # 0=quality dense (default) | 1=fast dense (~4-5x faster)
-DEPTH_MIN=-0                 # -1 = auto from sparse; set >0 as fallback for images with no sparse points
+DEPTH_MIN=-0.01                 # -1 = auto from sparse; set >0 as fallback for images with no sparse points
 DEPTH_MAX=100                 # -1 = auto from sparse; set >0 as fallback
 RESUME_DENSE=0               # 1 = skip cleanup+undistorter, go straight to patch_match_stereo
 FUSION_USE_CACHE=1          # 1 = stream depth maps in chunks (required when RAM < ~50GB for large datasets)
