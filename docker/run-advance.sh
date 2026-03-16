@@ -306,6 +306,7 @@ if should_run "matching"; then
         --FeatureMatching.use_gpu "$USE_GPU"
         --SiftMatching.max_ratio 0.8
         --FeatureMatching.max_num_matches "${MAX_MATCHES}"
+        --SiftMatching.max_ratio 0.8
         --SiftMatching.cross_check 1
         #--SiftMatching.guided_matching 1
         --TwoViewGeometry.min_num_inliers 20
@@ -321,7 +322,7 @@ if should_run "matching"; then
             "${MATCH_BASE_ARGS[@]}" \
             --SequentialMatching.overlap "${OVERLAP}" \
             --SequentialMatching.loop_detection 1 \
-            --SequentialMatching.loop_detection_num_images 30
+            --SequentialMatching.loop_detection_num_images 50
     elif [ "$MATCHER" = "vocab_tree" ]; then
         VOCAB_TREE="/working/vocab_tree.bin"
         if [ ! -f "${HOST_DIR}/vocab_tree.bin" ]; then
@@ -378,6 +379,7 @@ if should_run "sparse"; then
         MAPPER_ARGS+=(
             --Mapper.ba_use_gpu 1
             --Mapper.ba_refine_principal_point 1
+            --Mapper.ba_global_pba_gpu_index 0,0,0,0
         )
     fi
 
