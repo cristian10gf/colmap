@@ -306,7 +306,6 @@ if should_run "matching"; then
         --FeatureMatching.use_gpu "$USE_GPU"
         --SiftMatching.max_ratio 0.8
         --FeatureMatching.max_num_matches "${MAX_MATCHES}"
-        --SiftMatching.max_ratio 0.8
         --SiftMatching.cross_check 1
         #--SiftMatching.guided_matching 1
         --TwoViewGeometry.min_num_inliers 20
