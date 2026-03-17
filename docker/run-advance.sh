@@ -22,6 +22,9 @@ set -euo pipefail
 #   --ba-global-ratio N  : Global BA trigger ratio (default: 1.4; COLMAP default: 1.1 = every 10%)
 #                          1.4 = every 40% of new images → ~3x less global BA rounds
 #   --ba-max-iter N      : Max iterations per global BA round (default: 30; COLMAP default: 50)
+#   --refine-intrinsics  : Habilita refinamiento de focal y distorsión en BA incluso con
+#                          single_camera=1. Necesario cuando los frames no tienen EXIF
+#                          (extraídos de video) y el prior f=1.2×max_dim puede ser incorrecto.
 #   --fast-dense         : Fast dense mode: geom_consistency=0, filter=1, samples=7, iters=3, window_step=2
 #                          ~4-5x faster than default dense, moderate quality loss
 #   --depth-min M        : Fallback min depth [m] for PatchMatchStereo (default: -1 = auto from sparse).
@@ -67,7 +70,7 @@ OVERWRITE=1
 MESHER="poisson"
 MATCHER="sequential"       # sequential (best for video) | exhaustive | vocab_tree
 OVERLAP=20                 # overlap for sequential matcher (10 sufficient for 2 FPS video; was 20)
-SINGLE_CAMERA=0            # all frames share intrinsics (same camera/video)
+SINGLE_CAMERA=1            # all frames share intrinsics (same camera/video)
 CAMERA_MODEL="SIMPLE_RADIAL"  # COLMAP camera model (default: SIMPLE_RADIAL, good for most smartphone cameras; use OPENCV for more complex lenses)
 FORCE_CPU=0
 DSP_SIFT=0                 # DSP-SIFT: better features but forces CPU extraction (10-30x slower)
@@ -80,8 +83,9 @@ NUM_CPUS_OVERRIDE=""         # override nproc with --cpus N
 BA_GLOBAL_FRAMES_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_POINTS_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_MAX_ITER=50        # COLMAP default: 50 — fewer iterations per global BA round
+BA_REFINE_INTRINSICS=0       # 0=fija focal/distorsión en single_camera (default), 1=permite refinamiento
 FAST_DENSE=0                 # 0=quality dense (default) | 1=fast dense (~4-5x faster)
-DEPTH_MIN=-0.01                 # -1 = auto from sparse; set >0 as fallback for images with no sparse points
+DEPTH_MIN=0.001                 # -1 = auto from sparse; set >0 as fallback for images with no sparse points
 DEPTH_MAX=100                 # -1 = auto from sparse; set >0 as fallback
 RESUME_DENSE=0               # 1 = skip cleanup+undistorter, go straight to patch_match_stereo
 FUSION_USE_CACHE=1          # 1 = stream depth maps in chunks (required when RAM < ~50GB for large datasets)
@@ -109,6 +113,7 @@ while [[ $# -gt 0 ]]; do
         --dsp)              DSP_SIFT=1;           shift   ;;
         --ba-global-ratio)  BA_GLOBAL_FRAMES_RATIO="$2"; BA_GLOBAL_POINTS_RATIO="$2"; shift 2 ;;
         --ba-max-iter)      BA_GLOBAL_MAX_ITER="$2";                                  shift 2 ;;
+        --refine-intrinsics) BA_REFINE_INTRINSICS=1;                                  shift   ;;
         --fast-dense)       FAST_DENSE=1;                                              shift   ;;
         --depth-min)        DEPTH_MIN="$2";                                            shift 2 ;;
         --depth-max)        DEPTH_MAX="$2";                                            shift 2 ;;
@@ -381,15 +386,23 @@ if should_run "sparse"; then
         )
     fi
 
-    # With single camera (all frames share intrinsics), focal length and distortion
-    # are well-determined after the first few BA rounds. Skipping per-round refinement
-    # saves significant BA time without quality loss.
+    # Con single_camera=1, todos los frames comparten los mismos intrínsecos.
+    # Si los frames NO tienen EXIF (extraídos de video), el prior de focal es
+    # f=1.2×max_dim (estimación). En ese caso usar --refine-intrinsics para
+    # permitir que COLMAP auto-calibre la focal durante el BA.
+    # Si hay EXIF o se proveen --ImageReader.camera_params, se puede fijar (más rápido).
     if [ "$SINGLE_CAMERA" -eq 1 ]; then
-        MAPPER_ARGS+=(
-            --Mapper.ba_refine_focal_length 0
-            --Mapper.ba_refine_extra_params 0
-        )
-        echo "   Intrinsics       : fixed during BA (single camera mode)"
+        if [ "$BA_REFINE_INTRINSICS" -eq 0 ]; then
+            MAPPER_ARGS+=(
+                --Mapper.ba_refine_focal_length 0
+                --Mapper.ba_refine_extra_params 0
+            )
+            echo "   Intrinsics       : fijas en BA (single camera, sin --refine-intrinsics)"
+        else
+            echo "   Intrinsics       : refinables en BA (--refine-intrinsics activo)"
+        fi
+    else
+        echo "   Intrinsics       : por imagen (--no-single-camera, COLMAP refina cada cámara)"
     fi
 
     run_colmap mapper "${MAPPER_ARGS[@]}"
@@ -463,7 +476,7 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0,0)  # -1 = use ALL available GPUs
+        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0,0,0)  # -1 = use ALL available GPUs
     fi
 
     # Fallback depth bounds: required when some images have no visible sparse points.
