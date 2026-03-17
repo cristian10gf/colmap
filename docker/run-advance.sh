@@ -378,7 +378,6 @@ if should_run "sparse"; then
         MAPPER_ARGS+=(
             --Mapper.ba_use_gpu 1
             --Mapper.ba_refine_principal_point 1
-            --Mapper.ba_global_pba_gpu_index 0,0,0,0
         )
     fi
 
