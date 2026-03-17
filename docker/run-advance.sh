@@ -67,7 +67,7 @@ OVERWRITE=1
 MESHER="poisson"
 MATCHER="sequential"       # sequential (best for video) | exhaustive | vocab_tree
 OVERLAP=20                 # overlap for sequential matcher (10 sufficient for 2 FPS video; was 20)
-SINGLE_CAMERA=1            # all frames share intrinsics (same camera/video)
+SINGLE_CAMERA=0            # all frames share intrinsics (same camera/video)
 CAMERA_MODEL="SIMPLE_RADIAL"  # COLMAP camera model (default: SIMPLE_RADIAL, good for most smartphone cameras; use OPENCV for more complex lenses)
 FORCE_CPU=0
 DSP_SIFT=0                 # DSP-SIFT: better features but forces CPU extraction (10-30x slower)
@@ -313,7 +313,7 @@ if should_run "matching"; then
     )
 
     if [ "$USE_GPU" -eq 1 ]; then
-        MATCH_BASE_ARGS+=(--FeatureMatching.gpu_index 0,0,0,0)
+        MATCH_BASE_ARGS+=(--FeatureMatching.gpu_index 0,0)
     fi
 
     if [ "$MATCHER" = "sequential" ]; then
@@ -463,7 +463,7 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0,0,0)  # -1 = use ALL available GPUs
+        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0,0)  # -1 = use ALL available GPUs
     fi
 
     # Fallback depth bounds: required when some images have no visible sparse points.

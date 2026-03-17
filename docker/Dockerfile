@@ -20,8 +20,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Prepare and empty machine for building.
 # NOTE: libceres-dev is NOT installed from apt because Ubuntu's package lacks
 # CUDA/cuSOLVER support. Ceres is built from source below with -DUSE_CUDA=ON.
-# NOTE: libabsl-dev is NOT installed because Ubuntu 24.04 ships abseil 20230802,
-# pero Ceres master requiere >= 20240116. Se usa el submodule bundled de Ceres.
 RUN apt-get update && \
     apt-get install -y \
         ccache \
@@ -57,31 +55,10 @@ RUN apt-get update && \
 # but it still requires the OpenCV include directory to exist.
 RUN mkdir -p /usr/include/opencv4
 
-# cuDSS dev+runtime: requerido para GPU sparse BA (SPARSE_SCHUR en GPU).
-# El paquete apt instala:
-#   cmake config → /usr/lib/x86_64-linux-gnu/libcudss/12/cmake/cudss/
-#   headers      → /usr/include/libcudss/12/
-#
-# BUG del packaging Ubuntu: cudss-static-targets.cmake referencia libcudss_static.a
-# que no viene incluido en el paquete (solo está la shared lib).
-# cudss-config.cmake usa `if(EXISTS ...)` antes de cada include, así que
-# simplemente eliminar los archivos de static targets es suficiente — el config
-# los saltará automáticamente sin necesidad de parchear ningún cmake file.
-RUN apt-get install -y libcudss0-dev-cuda-12 && \
-    rm -f /usr/lib/x86_64-linux-gnu/libcudss/12/cmake/cudss/cudss-static-targets.cmake \
-          /usr/lib/x86_64-linux-gnu/libcudss/12/cmake/cudss/cudss-static-targets-release.cmake
-
-# Build Ceres Solver master (2.3.0) from source with CUDA + cuDSS support.
-# Ceres master declara versión 2.3.0 y tiene cuDSS merged desde mayo 2024.
-# Habilita tanto Dense GPU BA (DENSE_SCHUR) como Sparse GPU BA (SPARSE_SCHUR).
-#
-# IMPORTANTE: se usa --recurse-submodules para obtener abseil 20240116+ (bundled
-# en third_party/abseil-cpp). Ubuntu 24.04 solo tiene abseil 20230802, demasiado
-# antiguo — Ceres master requiere >= 20240116.
-#
-# cudss_DIR apunta al cmake config del paquete apt (ruta versionada no estándar).
-# cudss_INCLUDE_DIR también se pasa explícitamente por el mismo motivo.
-RUN git clone --depth 1 --branch master --recurse-submodules \
+# Build Ceres Solver 2.2.0 from source with CUDA support for GPU bundle adjustment.
+# Ceres 2.2.0 habilita Dense GPU BA (DENSE_SCHUR en GPU vía CUDA).
+# --depth 1 evita descargar todo el historial y reduce tiempo de build.
+RUN git clone --depth 1 --branch 2.2.0 \
         https://github.com/ceres-solver/ceres-solver.git /tmp/ceres-solver && \
     cd /tmp/ceres-solver && \
     mkdir build && cd build && \
@@ -90,8 +67,6 @@ RUN git clone --depth 1 --branch master --recurse-submodules \
         -DCMAKE_INSTALL_PREFIX=/colmap-install \
         -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
         -DUSE_CUDA=ON \
-        -Dcudss_DIR=/usr/lib/x86_64-linux-gnu/libcudss/12/cmake/cudss \
-        -Dcudss_INCLUDE_DIR=/usr/include/libcudss/12 \
         -DCMAKE_PREFIX_PATH=/colmap-install \
         -DBUILD_TESTING=OFF \
         -DBUILD_EXAMPLES=OFF \
@@ -102,12 +77,7 @@ RUN git clone --depth 1 --branch master --recurse-submodules \
 # Copy source into the image.
 COPY . /colmap
 
-# Build and install COLMAP, pointing CMake to our custom Ceres with CUDA + cuDSS.
-# cudss_DIR y cudss_INCLUDE_DIR se pasan explícitamente porque CeresConfig.cmake
-# contiene find_dependency(cudss) que re-ejecuta el cmake config de cuDSS.
-# El config de cuDSS usa rutas relativas para encontrar headers — en Ubuntu 24.04
-# los headers están en /usr/include/libcudss/12/ (ruta no estándar), así que
-# hay que forzar la ruta explícitamente.
+# Build and install COLMAP, pointing CMake to our custom Ceres with CUDA.
 RUN cd /colmap && \
     mkdir -p build/.ccache && \
     cd build && \
@@ -115,9 +85,7 @@ RUN cd /colmap && \
         -GNinja \
         -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
         -DCMAKE_INSTALL_PREFIX=/colmap-install \
-        -DCMAKE_PREFIX_PATH="/colmap-install;/usr/lib/x86_64-linux-gnu/libcudss/12" \
-        -Dcudss_DIR=/usr/lib/x86_64-linux-gnu/libcudss/12/cmake/cudss \
-        -Dcudss_INCLUDE_DIR=/usr/include/libcudss/12 \
+        -DCMAKE_PREFIX_PATH=/colmap-install \
         -DFETCHCONTENT_FULLY_DISCONNECTED=${FETCHCONTENT_FULLY_DISCONNECTED} \
         -DBLA_VENDOR=Intel10_64lp && \
     ninja install
@@ -165,8 +133,7 @@ RUN apt-get update && \
         libmkl-locale \
         libmkl-intel-lp64 \
         libmkl-intel-thread \
-        libmkl-core \
-        libcudss0-cuda-12 && \
+        libmkl-core && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -176,7 +143,4 @@ RUN apt-get update && \
 COPY --from=builder /colmap-install/ /usr/local/
 
 # Register newly copied shared libraries.
-# cuDSS se instala en una ruta versionada no estándar en Ubuntu — hay que añadirla
-# explícitamente a ldconfig para que el dynamic linker encuentre libcudss.so.0.
-RUN echo /usr/lib/x86_64-linux-gnu/libcudss/12 > /etc/ld.so.conf.d/cudss.conf && \
-    ldconfig
+RUN ldconfig
