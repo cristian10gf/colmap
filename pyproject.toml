@@ -1,11 +1,11 @@
 [build-system]
 requires = [
     "scikit-build-core>=0.3.3",
-    "pybind11==3.0.1",
+    "pybind11==3.0.2",
     "pybind11_stubgen @ git+https://github.com/sarlinpe/pybind11-stubgen@sarlinpe/fix-2025-08-20",
     "numpy",
-    "ruff==0.15.0",
-    "clang-format==21.1.8",
+    "ruff==0.15.7",
+    "clang-format==22.1.1",
 ]
 build-backend = "scikit_build_core.build"
 
@@ -14,7 +14,7 @@ name = "pycolmap"
 # WARNING: This version must follow the MAJOR.MINOR.PATCH format. If only
 # MAJOR.MINOR is used, cibuildwheel will add a .dev0 patch version, which
 # results in releasing a pre-release version on PyPI.
-version = "3.14.0.dev0"
+version = "4.1.0.dev0"
 description = "COLMAP bindings"
 readme = "python/README.md"
 authors = [

@@ -274,6 +274,10 @@ void GpuMat<T>::Read(const std::filesystem::path& path) {
   std::streampos pos = text_file.tellg();
   text_file.close();
 
+  THROW_CHECK_EQ(width, width_) << "File width does not match GpuMat width";
+  THROW_CHECK_EQ(height, height_) << "File height does not match GpuMat height";
+  THROW_CHECK_EQ(depth, depth_) << "File depth does not match GpuMat depth";
+
   std::fstream binary_file(path, std::ios::in | std::ios::binary);
   binary_file.seekg(pos);
 

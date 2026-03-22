@@ -30,8 +30,6 @@
 #pragma once
 
 #include "colmap/controllers/incremental_pipeline.h"
-#include "colmap/scene/reconstruction.h"
-#include "colmap/sensor/bitmap.h"
 #include "colmap/ui/automatic_reconstruction_widget.h"
 #include "colmap/ui/bundle_adjustment_widget.h"
 #include "colmap/ui/database_management_widget.h"
@@ -91,6 +89,7 @@ class MainWindow : public QMainWindow {
   void ProjectSaveAs();
   void Import();
   void ImportFrom();
+  void ImportFrom(const std::string& import_path);
   void Export();
   void ExportAll();
   void ExportAs();
