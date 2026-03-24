@@ -11,6 +11,9 @@ set -euo pipefail
 #   --max-matches N      : Max SIFT matches per pair (default: 32768)
 #   --matcher TYPE       : sequential (default) | exhaustive | vocab_tree
 #   --overlap N          : Sequential matcher overlap (default: 20)
+#   --vocab-tree-num-images N : Nº de imágenes candidatas por query en vocab_tree matcher (default: 150).
+#                          150 cubre bien interiores con pasillos repetitivos; subir a 200+ para escenas
+#                          con muchas zonas similares.
 #   --skip-to STAGE      : Resume from stage (extraction|matching|sparse|dense|fusion)
 #   --no-dense           : Skip dense reconstruction
 #   --mesh               : Enable mesh generation after stereo_fusion (default: disabled)
@@ -18,10 +21,15 @@ set -euo pipefail
 #   --no-single-camera   : Estimate separate intrinsics per image
 #   --camera-model MODEL : Camera model (default: SIMPLE_RADIAL)
 #   --cpu                : Force CPU mode (no GPU)
-#   --dsp                : Enable DSP-SIFT (better features, but CPU-only extraction, 10-30x slower)
+#   --sift               : Usar SIFT clásico en lugar de ALIKED+LightGlue (más rápido, peor en pasillos/oscuridad)
+#   --dsp                : Activar DSP-SIFT (implica --sift; extracción CPU-only, 10-30x más lento)
 #   --ba-global-ratio N  : Global BA trigger ratio (default: 1.4; COLMAP default: 1.1 = every 10%)
 #                          1.4 = every 40% of new images → ~3x less global BA rounds
 #   --ba-max-iter N      : Max iterations per global BA round (default: 30; COLMAP default: 50)
+#   --ba-max-refinements N : Global BA refinement loops per trigger (default: 2; COLMAP default: 5)
+#                          Each loop = retriangulation + full BA. 2 gives same quality as 5 in
+#                          incremental SfM because local BA fills in between triggers. 5 is
+#                          ~2.5x slower with negligible quality gain for indoor reconstructions.
 #   --refine-intrinsics  : Habilita refinamiento de focal y distorsión en BA incluso con
 #                          single_camera=1. Necesario cuando los frames no tienen EXIF
 #                          (extraídos de video) y el prior f=1.2×max_dim puede ser incorrecto.
@@ -38,6 +46,10 @@ set -euo pipefail
 #   --fusion-use-cache   : Enable StereoFusion streaming cache (use_cache=1). Required when RAM < total
 #                          size of all depth+normal maps (~50GB for 3143 images). Prevents OOM.
 #   --fusion-cache-size N: RAM (GB) for fusion streaming cache (default: 32). Only used with --fusion-use-cache.
+#   --geom-consistency N : PatchMatchStereo geom_consistency (0 or 1, default: 1).
+#                          1 = dos pasadas: fotométrica + geométrica → nube limpia, menos puntos (~6M).
+#                          0 = solo pasada fotométrica → más puntos (~15-18M) con más ruido en
+#                              superficies uniformes; fusión cae a photometric automáticamente.
 #
 # Example (full run):
 #   ./run-advance.sh ./south-building/
@@ -50,7 +62,7 @@ set -euo pipefail
 
 if [ $# -eq 0 ]; then
     echo "Usage: $0 <host_directory> [--cache-size 16] [--max-image-size 3200]"
-    echo "       [--max-features 8192] [--max-matches 32768]"
+    echo "       [--max-features 8192] [--max-matches 65536]"
     echo "       [--skip-to extraction|matching|sparse|dense|fusion]"
     echo "       [--no-dense] [--mesh] [--mesher poisson|delaunay]"
     echo "       [--matcher sequential|exhaustive|vocab_tree]"
@@ -59,17 +71,18 @@ if [ $# -eq 0 ]; then
 fi
 
 # --- Defaults ---
-CACHE_SIZE=16              # GB of VRAM for PatchMatchStereo
+CACHE_SIZE=32              # GB of VRAM for PatchMatchStereo
 MAX_IMAGE_SIZE=3200        # pixels (COLMAP thresholds are tuned for ~3200)
 MAX_FEATURES=8192          # SIFT features per image
-MAX_MATCHES=32768          # matches per image pair
+MAX_MATCHES=65536          # matches per image pair
 SKIP_TO=""                 # resume from this stage
 RUN_DENSE=1
 RUN_MESH=0
 OVERWRITE=1
 MESHER="poisson"
-MATCHER="exhaustive"       # sequential (best for video) | exhaustive | vocab_tree
+MATCHER="exhaustive"       # sequential | exhaustive | vocab_tree
 OVERLAP=20                 # overlap for sequential matcher (10 sufficient for 2 FPS video; was 20)
+VOCAB_TREE_NUM_IMAGES=150  # candidatos por query en vocab_tree matcher (150 cubre bien interiores)
 SINGLE_CAMERA=1            # all frames share intrinsics (same camera/video)
 CAMERA_MODEL="SIMPLE_RADIAL"  # COLMAP camera model (default: SIMPLE_RADIAL, good for most smartphone cameras; use OPENCV for more complex lenses)
 FORCE_CPU=0
@@ -90,6 +103,7 @@ DEPTH_MAX=100.0                 # -1 = auto from sparse; set >0 as fallback
 RESUME_DENSE=0               # 1 = skip cleanup+undistorter, go straight to patch_match_stereo
 FUSION_USE_CACHE=1          # 1 = stream depth maps in chunks (required when RAM < ~50GB for large datasets)
 FUSION_CACHE_SIZE=32         # GB of RAM for fusion streaming cache (only used when FUSION_USE_CACHE=1)
+GEOM_CONSISTENCY=0           # 1=dos pasadas (fotométrica+geométrica, nube limpia) | 0=solo fotométrica (más puntos, más ruido)
 
 HOST_DIR=$(realpath "$1")
 shift
@@ -120,6 +134,8 @@ while [[ $# -gt 0 ]]; do
         --resume-dense)     RESUME_DENSE=1;                                            shift   ;;
         --fusion-use-cache) FUSION_USE_CACHE=1;                                        shift   ;;
         --fusion-cache-size) FUSION_CACHE_SIZE="$2";                                   shift 2 ;;
+        --geom-consistency) GEOM_CONSISTENCY="$2";                                     shift 2 ;;
+        --vocab-tree-num-images) VOCAB_TREE_NUM_IMAGES="$2";                           shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -217,7 +233,7 @@ if [ "$OVERWRITE" -eq 1 ] && [ -z "$SKIP_TO" ]; then
         -v "${HOST_DIR}:/working" \
         -w /working \
         "${COLMAP_IMAGE}" \
-        bash -c "rm -rf /working/database.db /working/sparse /working/dense && echo 'Removed: database.db  sparse/  dense/'"
+        bash -c "rm -rf /working/database.db /working/database.db-shm /working/database.db-wal /working/sparse /working/dense && echo 'Removed: database.db  database.db-shm  database.db-wal  sparse/  dense/'"
 fi
 
 # --- Docker base arguments (reused for every stage) ---
@@ -293,7 +309,7 @@ if should_run "extraction"; then
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        EXTRACT_ARGS+=(--FeatureExtraction.gpu_index 0,0,0)
+        EXTRACT_ARGS+=(--FeatureExtraction.gpu_index 0,0,0,0,0)
     fi
 
     run_colmap feature_extractor "${EXTRACT_ARGS[@]}"
@@ -318,7 +334,7 @@ if should_run "matching"; then
     )
 
     if [ "$USE_GPU" -eq 1 ]; then
-        MATCH_BASE_ARGS+=(--FeatureMatching.gpu_index 0,0)
+        MATCH_BASE_ARGS+=(--FeatureMatching.gpu_index 0,0,0,0,0)
     fi
 
     if [ "$MATCHER" = "sequential" ]; then
@@ -328,22 +344,25 @@ if should_run "matching"; then
             --SequentialMatching.loop_detection 1 \
             --SequentialMatching.loop_detection_num_images 50
     elif [ "$MATCHER" = "vocab_tree" ]; then
-        VOCAB_TREE="/working/vocab_tree.bin"
-        if [ ! -f "${HOST_DIR}/vocab_tree.bin" ]; then
-            echo "vocab_tree_matcher requires a vocabulary tree file."
-            echo "Download one from https://demuc.de/colmap/ and place it at:"
-            echo "  ${HOST_DIR}/vocab_tree.bin"
-            echo ""
-            echo "Recommended sizes:"
-            echo "  < 1000 images : vocab_tree_flickr100K_words32K.bin"
-            echo "  1K-10K images : vocab_tree_flickr100K_words256K.bin"
-            echo "  > 10K images  : vocab_tree_flickr100K_words1M.bin"
-            exit 1
+        # El vocab tree se descarga automáticamente según el tipo de feature:
+        #   ALIKED N32 → vocab_tree_faiss_flickr100K_words64K_aliked_n32.bin
+        #   SIFT       → vocab_tree_faiss_flickr100K_words256K.bin
+        # COLMAP usa GetVocabTreeUriForFeatureType() cuando vocab_tree_path está vacío
+        # (requiere DOWNLOAD_ENABLED=ON, ya compilado en la imagen).
+        # Si existe un vocab tree local en la carpeta de la serie, se usa ese en su lugar.
+        VOCAB_TREE_ARGS=(
+            --VocabTreeMatching.num_images "${VOCAB_TREE_NUM_IMAGES}"
+        )
+        if [ -f "${HOST_DIR}/vocab_tree.bin" ]; then
+            echo "   Vocab tree       : local (${HOST_DIR}/vocab_tree.bin)"
+            VOCAB_TREE_ARGS+=(--VocabTreeMatching.vocab_tree_path /working/vocab_tree.bin)
+        else
+            echo "   Vocab tree       : auto-descarga según tipo de feature"
         fi
+        echo "   Candidatos/query : ${VOCAB_TREE_NUM_IMAGES} imágenes"
         run_colmap vocab_tree_matcher \
             "${MATCH_BASE_ARGS[@]}" \
-            --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
-            --VocabTreeMatching.num_images 100
+            "${VOCAB_TREE_ARGS[@]}"
     else
         run_colmap exhaustive_matcher "${MATCH_BASE_ARGS[@]}"
     fi
@@ -359,6 +378,23 @@ if should_run "sparse"; then
     echo "   BA global ratio  : ${BA_GLOBAL_FRAMES_RATIO}  |  BA max iters: ${BA_GLOBAL_MAX_ITER}"
     [ "$USE_GPU" -eq 1 ] && echo "   BA GPU solver    : ON (--Mapper.ba_use_gpu 1)"
 
+    # --- Pre-flight: verify GPU BA (cuDSS/CUDA_SPARSE) is actually available ---
+    # If Ceres was built without cuDSS, ba_use_gpu silently falls back to CPU.
+    # That causes 10-18 min per global BA round instead of <30s on GPU.
+    if [ "$USE_GPU" -eq 1 ]; then
+        CUDSS_CHECK=$(docker run --rm "${GPU_ARGS[@]}" "${COLMAP_IMAGE}" \
+            bash -c 'ldconfig -p | grep -c libcudss' 2>/dev/null || echo "0")
+        if [ "${CUDSS_CHECK:-0}" -eq 0 ]; then
+            echo ""
+            echo "ERROR: libcudss not found in the runtime container." >&2
+            echo "  GPU bundle adjustment will NOT work (CPU fallback = hours of BA)." >&2
+            echo "  Rebuild the Docker image: cd docker && ./build.sh" >&2
+            echo "  The fix is in the Dockerfile (cuDSS runtime path and Ceres cmake)." >&2
+            exit 1
+        fi
+        echo "   cuDSS runtime    : OK (libcudss found)"
+    fi
+
     MAPPER_ARGS=(
         --database_path ./database.db
         --image_path ./images
@@ -371,14 +407,12 @@ if should_run "sparse"; then
         --Mapper.ba_global_ignore_redundant_points3D 1
         # --- Use all CPU threads for triangulation/registration ---
         --Mapper.num_threads -1
-        --Mapper.init_min_tri_angle 8
-        --Mapper.tri_min_angle 1.5
         --Mapper.ba_local_num_images 8
     )
 
-    # GPU Bundle Adjustment: activates CUDA Ceres solver (cuSolver/cuDSS).
-    # Avoids the dense CPU Cholesky path that fails with >500 images.
-    # Requires Ceres built with USE_CUDA=ON (already done in local Dockerfile).
+    # GPU Bundle Adjustment: CUDA_SPARSE solver via cuDSS (sparse Cholesky on GPU).
+    # Requires Ceres built with USE_CUDA=ON + cuDSS found (confirmed pre-flight above).
+    # Eliminates the "dense Cholesky factorization" failures seen with CPU fallback.
     if [ "$USE_GPU" -eq 1 ]; then
         MAPPER_ARGS+=(
             --Mapper.ba_use_gpu 1
@@ -493,7 +527,7 @@ echo "   Sparse model: $BEST_SPARSE_REL"
 if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
     echo ""
     echo "[4/5] Dense Reconstruction (PatchMatchStereo)..."
-    echo "   VRAM cache: ${CACHE_SIZE}GB  |  Max image: ${MAX_IMAGE_SIZE}px"
+    echo "   VRAM cache: ${CACHE_SIZE}GB  |  Max image dense: 1200px (SfM: ${MAX_IMAGE_SIZE}px)"
     echo "   Using sparse model: $BEST_SPARSE_REL"
 
     if [ "$RESUME_DENSE" -eq 1 ]; then
@@ -513,22 +547,27 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
             --output_type COLMAP
     fi
 
-    # GEOM_CONSISTENCY tracks whether patch_match_stereo generated consistency_graphs/.
-    # stereo_fusion --input_type geometric requires those graphs.
-    # write_consistency_graph=1 enables their generation (required for geometric fusion).
-    GEOM_CONSISTENCY=1
+    # GEOM_CONSISTENCY controla si patch_match_stereo genera consistency_graphs/.
+    # stereo_fusion --input_type geometric requiere esos grafos (write_consistency_graph=1).
+    # El valor viene del parámetro CLI --geom-consistency (default: 1).
+    # 0 = solo pasada fotométrica → más puntos, más ruido en superficies uniformes.
+    if [ "${GEOM_CONSISTENCY}" -eq 1 ]; then
+        WRITE_CONSISTENCY_GRAPH=1
+    else
+        WRITE_CONSISTENCY_GRAPH=0
+    fi
 
     if [ "$FAST_DENSE" -eq 1 ]; then
         # Fast mode: fewer samples/iterations + doubled window step for ~4-5x speedup.
         DENSE_ARGS=(
             --workspace_path ./dense/0
             --workspace_format COLMAP
-            --PatchMatchStereo.max_image_size "${MAX_IMAGE_SIZE}"
+            --PatchMatchStereo.max_image_size 1200
             --PatchMatchStereo.cache_size "${CACHE_SIZE}"
             --PatchMatchStereo.num_samples 7
             --PatchMatchStereo.num_iterations 3
-            --PatchMatchStereo.geom_consistency 1
-            --PatchMatchStereo.write_consistency_graph 1
+            --PatchMatchStereo.geom_consistency "${GEOM_CONSISTENCY}"
+            --PatchMatchStereo.write_consistency_graph "${WRITE_CONSISTENCY_GRAPH}"
             --PatchMatchStereo.filter 1
             --PatchMatchStereo.window_step 2
         )
@@ -537,17 +576,21 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
         DENSE_ARGS=(
             --workspace_path ./dense/0
             --workspace_format COLMAP
-            --PatchMatchStereo.max_image_size "${MAX_IMAGE_SIZE}"
+            --PatchMatchStereo.max_image_size 1200
             --PatchMatchStereo.cache_size "${CACHE_SIZE}"
             --PatchMatchStereo.num_samples 15
             --PatchMatchStereo.num_iterations 5
-            --PatchMatchStereo.geom_consistency 1
-            --PatchMatchStereo.write_consistency_graph 1
+            --PatchMatchStereo.geom_consistency "${GEOM_CONSISTENCY}"
+            --PatchMatchStereo.write_consistency_graph "${WRITE_CONSISTENCY_GRAPH}"
+            --PatchMatchStereo.filter 1
+            --PatchMatchStereo.filter_min_nc 0.07
         )
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0,0,0,0,0)  # -1 = use ALL available GPUs
+        # RTX 4000 Ada: 48 SMs, ceil(1200/32)=38 bloques/imagen → óptimo ~5 threads simultáneos.
+        # VRAM: 5 × 221 MB datos + 200 MB contexto = ~1.3 GB (de 20 GB disponibles).
+        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0,0,0,0,0)
     fi
 
     # Fallback depth bounds: required when some images have no visible sparse points.
@@ -584,7 +627,7 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "fusion"; then
     # Use geometric fusion only when consistency_graphs/ were generated (geom_consistency=1).
     # If geom_consistency=0 was used, consistency_graphs/ is empty and geometric fusion
     # produces almost no points (~2000); photometric fusion uses depth maps directly.
-    if [ "${GEOM_CONSISTENCY:-1}" -eq 1 ]; then
+    if [ "${GEOM_CONSISTENCY}" -eq 1 ]; then
         FUSION_INPUT_TYPE="geometric"
     else
         FUSION_INPUT_TYPE="photometric"
