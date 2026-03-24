@@ -10,17 +10,24 @@ Asume la estructura:
 
 Modos:
   --mode automatic   Ejecuta automatic_reconstructor (por defecto)
-  --mode advanced    Reutiliza run-advance.sh para control fino
+  --mode advanced    Reutiliza run-advance.sh para control fino (recomendado para >500 imagenes)
   --mode shell       Abre una shell dentro del contenedor
 
 Opciones:
   --data-root PATH            Carpeta base de datasets
   --force-context-default     Ejecuta "docker context use default" antes de correr
   --cpu                       Fuerza ejecucion sin GPU
+  --cpus N                    Numero de CPUs para Docker (default: todos)
+  --hier                      Usa mapper jerarquico en modo automatic (mejor para >500 imagenes)
   -h, --help                  Muestra esta ayuda
+
+NOTA: Para control total de GPU en Bundle Adjustment y reducir BA global periodico,
+      usa --mode advanced. El modo automatic solo expone opciones de alto nivel.
 
 Ejemplos:
   ./run-series.sh edificio-a
+  ./run-series.sh edificio-a --hier
+  ./run-series.sh edificio-a --mode advanced
   ./run-series.sh edificio-a --mode advanced -- --max-image-size 4000 --cache-size 16
   ./run-series.sh edificio-a --mode shell
 EOF
@@ -32,8 +39,10 @@ DATA_ROOT="${PROJECT_ROOT}/preprocesamiento/data"
 MODE="automatic"
 FORCE_CPU=0
 FORCE_CONTEXT_DEFAULT=0
+NUM_CPUS_OVERRIDE=""
 SERIES=""
 EXTRA_ARGS=()
+MAP_TYPE="incremental"  # hierarchical is better for >500 images (use --hier)
 
 if [ $# -eq 0 ]; then
     usage
@@ -60,6 +69,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --cpu)
             FORCE_CPU=1
+            shift
+            ;;
+        --cpus)
+            NUM_CPUS_OVERRIDE="$2"
+            shift 2
+            ;;
+        --hier)
+            MAP_TYPE="hierarchical"
             shift
             ;;
         --)
@@ -205,6 +222,9 @@ if [ "$MODE" = "advanced" ]; then
     if [ "$FORCE_CPU" -eq 1 ]; then
         ADV_ARGS+=(--cpu)
     fi
+    if [ -n "$NUM_CPUS_OVERRIDE" ]; then
+        ADV_ARGS+=(--cpus "$NUM_CPUS_OVERRIDE")
+    fi
     if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
         ADV_ARGS+=("${EXTRA_ARGS[@]}")
         echo "Args extra   : ${EXTRA_ARGS[*]}"
@@ -215,7 +235,11 @@ fi
 COLMAP_IMAGE=$(select_colmap_image)
 configure_gpu_args "$COLMAP_IMAGE"
 
-NUM_CPUS=$(nproc)
+if [ -n "$NUM_CPUS_OVERRIDE" ]; then
+    NUM_CPUS="$NUM_CPUS_OVERRIDE"
+else
+    NUM_CPUS=$(nproc)
+fi
 DOCKER_ARGS=(
     --rm
     -v "${SERIES_DIR}:/working"
@@ -229,12 +253,23 @@ if [ ${#GPU_ARGS[@]} -gt 0 ]; then
     DOCKER_ARGS+=("${GPU_ARGS[@]}")
 fi
 
+# automatic_reconstructor solo acepta opciones de alto nivel:
+#   --use_gpu, --gpu_index, --num_threads, --mapper {incremental,hierarchical,global}
+# Los parametros --Mapper.ba_* (BA global, GPU solver, etc.) NO son accesibles desde aqui.
+# Para control total de BA y priorizacion GPU, usa --mode advanced.
 AUTO_ARGS=(
     automatic_reconstructor
     --image_path ./images
     --workspace_path .
     --use_gpu "$USE_GPU"
+    --num_threads "$NUM_CPUS"
+    --mapper "$MAP_TYPE"
 )
+
+# GPU index para extraccion y matching (lo que SÍ acepta automatic_reconstructor con GPU).
+if [ "$USE_GPU" -eq 1 ]; then
+    AUTO_ARGS+=(--gpu_index -1)  # -1 = todas las GPUs disponibles
+fi
 
 if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
     AUTO_ARGS+=("${EXTRA_ARGS[@]}")
@@ -242,10 +277,11 @@ fi
 
 echo "Serie        : $SERIES_DIR"
 echo "Imagenes     : $IMAGES_DIR"
-echo "Modo         : automatic"
-echo "GPU          : $USE_GPU"
+echo "Modo         : automatic (mapper=${MAP_TYPE})"
+echo "GPU          : $USE_GPU (extraccion + matching; BA=CPU)"
 echo "CPUs         : $NUM_CPUS"
 echo "Resultados   : $SERIES_DIR"
+[ "$MAP_TYPE" = "incremental" ] && echo "NOTA         : Para conjuntos >500 imagenes considera --hier o --mode advanced"
 echo ""
 
 run_with_docker_hint docker run "${DOCKER_ARGS[@]}" "$COLMAP_IMAGE" colmap "${AUTO_ARGS[@]}"
