@@ -21,6 +21,21 @@ set -euo pipefail
 #   --no-single-camera   : Estimate separate intrinsics per image
 #   --camera-model MODEL : Camera model (default: SIMPLE_RADIAL)
 #   --cpu                : Force CPU mode (no GPU)
+#   --feature-backend TYPE : colmap (default) | roma
+#   --matching-backend TYPE: colmap (default) | roma
+#   --roma               : Shortcut for --feature-backend roma --matching-backend roma
+#   --roma-fallback      : If RoMa backend fails, fallback to native COLMAP backend (default)
+#   --no-roma-fallback   : Disable fallback; fail fast if RoMa backend fails
+#   --roma-image TAG     : Docker image for RoMa bridge (default: roma-integration:latest)
+#   --roma-rebuild       : Rebuild RoMa image before running bridge
+#   --roma-setting NAME  : RoMaV2 setting (default: precise)
+#   --roma-match-type T  : COLMAP matches_importer type: raw (default) | inliers
+#   --roma-max-correspondences N : Requested correspondences sampled by RoMa (default: 5000)
+#   --roma-confidence-threshold F: Min RoMa overlap confidence (default: 0.2)
+#   --roma-min-correspondences N : Min correspondences to keep a pair (default: 64)
+#   --roma-max-pairs N   : Max pair count processed by RoMa (default: 0 = all)
+#   --roma-compile       : Enable torch.compile path in RoMaV2
+#   --roma-pairs-mode M  : auto (default) | sequential | exhaustive
 #   --sift               : Usar SIFT clásico en lugar de ALIKED+LightGlue (más rápido, peor en pasillos/oscuridad)
 #   --dsp                : Activar DSP-SIFT (implica --sift; extracción CPU-only, 10-30x más lento)
 #   --ba-global-ratio N  : Global BA trigger ratio (default: 1.4; COLMAP default: 1.1 = every 10%)
@@ -71,9 +86,15 @@ if [ $# -eq 0 ]; then
     echo "       [--skip-to extraction|matching|sparse|dense|fusion]"
     echo "       [--no-dense] [--mesh] [--mesher poisson|delaunay]"
     echo "       [--matcher sequential|exhaustive|vocab_tree]"
+    echo "       [--feature-backend colmap|roma] [--matching-backend colmap|roma]"
+    echo "       [--roma] [--no-roma-fallback] [--roma-image roma-integration:latest]"
     echo "       [--no-single-camera] [--camera-model SIMPLE_RADIAL] [--cpu]"
     exit 1
 fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/../../../..")"
+ROMA_RUN_SH="${PROJECT_ROOT}/preprocesamiento/models/roma/docker/run.sh"
 
 # --- Defaults ---
 CACHE_SIZE=32              # GB of VRAM for PatchMatchStereo
@@ -93,6 +114,22 @@ CAMERA_MODEL="SIMPLE_RADIAL"  # COLMAP camera model (default: SIMPLE_RADIAL, goo
 FORCE_CPU=0
 DSP_SIFT=0                 # DSP-SIFT: better features but forces CPU extraction (10-30x slower)
 NUM_CPUS_OVERRIDE=""         # override nproc with --cpus N
+FEATURE_BACKEND="colmap"   # colmap | roma
+MATCHING_BACKEND="colmap"  # colmap | roma
+ROMA_FALLBACK=1            # 1=fallback to colmap if RoMa fails
+ROMA_IMAGE="roma-integration:latest"
+ROMA_REBUILD=0
+ROMA_SETTING="precise"
+ROMA_MATCH_TYPE="raw"      # raw | inliers
+ROMA_MAX_CORRESPONDENCES=5000
+ROMA_CONFIDENCE_THRESHOLD=0.2
+ROMA_MIN_CORRESPONDENCES=64
+ROMA_MAX_PAIRS=0
+ROMA_COMPILE=0
+ROMA_PAIRS_MODE="auto"     # auto | sequential | exhaustive
+ROMA_BRIDGE_RAN=0
+ROMA_FEATURES_IMPORTED=0
+ROMA_BRIDGE_MATCH_LIST=""
 
 # --- Bundle Adjustment (Mapper) ---
 # COLMAP default for ba_global_*_ratio is 1.1 (triggers global BA every 10% new images/points).
@@ -130,6 +167,21 @@ while [[ $# -gt 0 ]]; do
         --no-single-camera) SINGLE_CAMERA=0;      shift   ;;
         --camera-model)     CAMERA_MODEL="$2";    shift 2 ;;
         --cpu)              FORCE_CPU=1;          shift   ;;
+        --feature-backend)  FEATURE_BACKEND="$2"; shift 2 ;;
+        --matching-backend) MATCHING_BACKEND="$2"; shift 2 ;;
+        --roma)             FEATURE_BACKEND="roma"; MATCHING_BACKEND="roma"; shift ;;
+        --roma-fallback)    ROMA_FALLBACK=1; shift ;;
+        --no-roma-fallback) ROMA_FALLBACK=0; shift ;;
+        --roma-image)       ROMA_IMAGE="$2"; shift 2 ;;
+        --roma-rebuild)     ROMA_REBUILD=1; shift ;;
+        --roma-setting)     ROMA_SETTING="$2"; shift 2 ;;
+        --roma-match-type)  ROMA_MATCH_TYPE="$2"; shift 2 ;;
+        --roma-max-correspondences) ROMA_MAX_CORRESPONDENCES="$2"; shift 2 ;;
+        --roma-confidence-threshold) ROMA_CONFIDENCE_THRESHOLD="$2"; shift 2 ;;
+        --roma-min-correspondences) ROMA_MIN_CORRESPONDENCES="$2"; shift 2 ;;
+        --roma-max-pairs)   ROMA_MAX_PAIRS="$2"; shift 2 ;;
+        --roma-compile)     ROMA_COMPILE=1; shift ;;
+        --roma-pairs-mode)  ROMA_PAIRS_MODE="$2"; shift 2 ;;
         --cpus)             NUM_CPUS_OVERRIDE="$2"; shift 2 ;;
         --dsp)              DSP_SIFT=1;           shift   ;;
         --ba-global-ratio)  BA_GLOBAL_FRAMES_RATIO="$2"; BA_GLOBAL_POINTS_RATIO="$2"; shift 2 ;;
@@ -148,6 +200,53 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
+
+case "$FEATURE_BACKEND" in
+    colmap|roma) ;;
+    *)
+        echo "Error: --feature-backend must be colmap or roma (got '$FEATURE_BACKEND')."
+        exit 1
+        ;;
+esac
+
+case "$MATCHING_BACKEND" in
+    colmap|roma) ;;
+    *)
+        echo "Error: --matching-backend must be colmap or roma (got '$MATCHING_BACKEND')."
+        exit 1
+        ;;
+esac
+
+if [ "$FEATURE_BACKEND" != "$MATCHING_BACKEND" ]; then
+    echo "Error: use the same backend for extraction and matching."
+    echo "  Supported combos:"
+    echo "    --feature-backend colmap --matching-backend colmap"
+    echo "    --feature-backend roma --matching-backend roma"
+    exit 1
+fi
+
+case "$ROMA_MATCH_TYPE" in
+    raw|inliers) ;;
+    *)
+        echo "Error: --roma-match-type must be raw or inliers (got '$ROMA_MATCH_TYPE')."
+        exit 1
+        ;;
+esac
+
+case "$ROMA_PAIRS_MODE" in
+    auto|sequential|exhaustive) ;;
+    *)
+        echo "Error: --roma-pairs-mode must be auto, sequential or exhaustive (got '$ROMA_PAIRS_MODE')."
+        exit 1
+        ;;
+esac
+
+if [ "$FEATURE_BACKEND" = "roma" ] || [ "$MATCHING_BACKEND" = "roma" ]; then
+    if [ ! -x "$ROMA_RUN_SH" ]; then
+        echo "Error: RoMa bridge runner not found or not executable: $ROMA_RUN_SH"
+        exit 1
+    fi
+fi
 
 if [ "$RUN_DENSE" -eq 0 ] && [ "$RUN_MESH" -eq 1 ]; then
     echo "WARN: --mesh ignored because --no-dense was set."
@@ -220,6 +319,14 @@ echo "  Matcher          : $MATCHER"
 echo "  Camera model     : $CAMERA_MODEL"
 echo "  Single camera    : $SINGLE_CAMERA"
 echo "  DSP-SIFT         : $DSP_SIFT"
+echo "  Feature backend  : $FEATURE_BACKEND"
+echo "  Matching backend : $MATCHING_BACKEND"
+if [ "$FEATURE_BACKEND" = "roma" ] || [ "$MATCHING_BACKEND" = "roma" ]; then
+    echo "  RoMa fallback    : $ROMA_FALLBACK"
+    echo "  RoMa image       : $ROMA_IMAGE"
+    echo "  RoMa setting     : $ROMA_SETTING"
+    echo "  RoMa match type  : $ROMA_MATCH_TYPE"
+fi
 [ "$MATCHER" = "sequential" ] && echo "  Overlap          : $OVERLAP"
   echo "  BA global ratio  : ${BA_GLOBAL_FRAMES_RATIO} (COLMAP default: 1.1)"
   echo "  BA max iters     : ${BA_GLOBAL_MAX_ITER} (COLMAP default: 50)"
@@ -270,6 +377,204 @@ run_colmap() {
         "$@"
 }
 
+resolve_roma_pairs_mode() {
+    if [ "$ROMA_PAIRS_MODE" != "auto" ]; then
+        echo "$ROMA_PAIRS_MODE"
+        return
+    fi
+
+    if [ "$MATCHER" = "sequential" ]; then
+        echo "sequential"
+    else
+        # vocab_tree has no direct RoMa pairing equivalent; exhaustive gives global coverage.
+        echo "exhaustive"
+    fi
+}
+
+run_roma_bridge() {
+    if [ "$ROMA_BRIDGE_RAN" -eq 1 ]; then
+        return 0
+    fi
+
+    local pairs_mode
+    pairs_mode="$(resolve_roma_pairs_mode)"
+
+    local bridge_args=()
+    bridge_args+=(--pairs-mode "$pairs_mode")
+    bridge_args+=(--setting "$ROMA_SETTING")
+    bridge_args+=(--match-type "$ROMA_MATCH_TYPE")
+    bridge_args+=(--max-correspondences "$ROMA_MAX_CORRESPONDENCES")
+    bridge_args+=(--confidence-threshold "$ROMA_CONFIDENCE_THRESHOLD")
+    bridge_args+=(--min-correspondences "$ROMA_MIN_CORRESPONDENCES")
+
+    if [ "$pairs_mode" = "sequential" ]; then
+        bridge_args+=(--sequential-overlap "$OVERLAP")
+    fi
+    if [ "$ROMA_MAX_PAIRS" -gt 0 ]; then
+        bridge_args+=(--max-pairs "$ROMA_MAX_PAIRS")
+    fi
+    if [ "$ROMA_COMPILE" -eq 1 ]; then
+        bridge_args+=(--compile)
+    else
+        bridge_args+=(--no-compile)
+    fi
+
+    local roma_args=("$HOST_DIR" --image "$ROMA_IMAGE")
+    if [ "$ROMA_REBUILD" -eq 1 ]; then
+        roma_args+=(--rebuild)
+    fi
+    if [ "$FORCE_CPU" -eq 1 ]; then
+        roma_args+=(--cpu)
+    fi
+    roma_args+=(--)
+    roma_args+=("${bridge_args[@]}")
+
+    echo "   RoMa bridge      : running (${pairs_mode}, setting=${ROMA_SETTING})"
+    if ! "$ROMA_RUN_SH" "${roma_args[@]}"; then
+        return 1
+    fi
+
+    local match_list_host
+    if [ "$ROMA_MATCH_TYPE" = "inliers" ]; then
+        match_list_host="${HOST_DIR}/roma/matches_inliers.txt"
+        ROMA_BRIDGE_MATCH_LIST="./roma/matches_inliers.txt"
+    else
+        match_list_host="${HOST_DIR}/roma/matches_raw.txt"
+        ROMA_BRIDGE_MATCH_LIST="./roma/matches_raw.txt"
+    fi
+
+    if [ ! -d "${HOST_DIR}/roma/features" ]; then
+        echo "ERROR: RoMa bridge finished but roma/features is missing." >&2
+        return 1
+    fi
+    if [ ! -s "$match_list_host" ]; then
+        echo "ERROR: RoMa bridge finished but match list is missing or empty: $match_list_host" >&2
+        return 1
+    fi
+
+    ROMA_BRIDGE_RAN=1
+    return 0
+}
+
+import_roma_features() {
+    if [ "$ROMA_FEATURES_IMPORTED" -eq 1 ]; then
+        return 0
+    fi
+
+    if [ ! -f "${HOST_DIR}/database.db" ]; then
+        run_colmap database_creator --database_path ./database.db
+    fi
+
+    run_colmap feature_importer \
+        --database_path ./database.db \
+        --image_path ./images \
+        --import_path ./roma/features
+
+    ROMA_FEATURES_IMPORTED=1
+    return 0
+}
+
+run_colmap_feature_extraction() {
+    local extract_args=(
+        --database_path ./database.db
+        --image_path ./images
+        --ImageReader.camera_model "$CAMERA_MODEL"
+        --ImageReader.single_camera "$SINGLE_CAMERA"
+        --FeatureExtraction.use_gpu "$USE_GPU"
+        --FeatureExtraction.max_image_size "${MAX_IMAGE_SIZE}"
+        --SiftExtraction.max_num_features "${MAX_FEATURES}"
+        --SiftExtraction.first_octave -1
+        --SiftExtraction.num_octaves 4
+        --SiftExtraction.octave_resolution 4
+        --SiftExtraction.peak_threshold 0.004
+        --SiftExtraction.edge_threshold 10
+    )
+
+    # domain_size_pooling and estimate_affine_shape produce better features
+    # but FORCE CPU-only extraction (10-30x slower). Only enable via flag.
+    if [ "${DSP_SIFT:-0}" -eq 1 ]; then
+        extract_args+=(
+            --SiftExtraction.domain_size_pooling 1
+            --SiftExtraction.estimate_affine_shape 1
+        )
+        echo "   DSP-SIFT enabled (CPU extraction, slower but better features)"
+    fi
+
+    if [ "$USE_GPU" -eq 1 ]; then
+        extract_args+=(--FeatureExtraction.gpu_index 0,0,0)
+    fi
+
+    run_colmap feature_extractor "${extract_args[@]}"
+}
+
+run_roma_feature_extraction() {
+    if ! run_roma_bridge; then
+        return 1
+    fi
+    import_roma_features
+}
+
+run_colmap_feature_matching() {
+    local match_base_args=(
+        --database_path ./database.db
+        --FeatureMatching.use_gpu "$USE_GPU"
+        --SiftMatching.max_ratio 0.8
+        --FeatureMatching.max_num_matches "${MAX_MATCHES}"
+        --SiftMatching.cross_check 1
+        #--SiftMatching.guided_matching 1
+        --TwoViewGeometry.min_num_inliers 20
+        #--ExhaustiveMatching.block_size 150
+    )
+
+    if [ "$USE_GPU" -eq 1 ]; then
+        match_base_args+=(--FeatureMatching.gpu_index 0,0,0,0,0)
+    fi
+
+    if [ "$MATCHER" = "sequential" ]; then
+        run_colmap sequential_matcher \
+            "${match_base_args[@]}" \
+            --SequentialMatching.overlap "${OVERLAP}" \
+            --SequentialMatching.loop_detection 1 \
+            --SequentialMatching.loop_detection_num_images 50
+    elif [ "$MATCHER" = "vocab_tree" ]; then
+        # El vocab tree se descarga automáticamente según el tipo de feature:
+        #   ALIKED N32 → vocab_tree_faiss_flickr100K_words64K_aliked_n32.bin
+        #   SIFT       → vocab_tree_faiss_flickr100K_words256K.bin
+        # COLMAP usa GetVocabTreeUriForFeatureType() cuando vocab_tree_path está vacío
+        # (requiere DOWNLOAD_ENABLED=ON, ya compilado en la imagen).
+        # Si existe un vocab tree local en la carpeta de la serie, se usa ese en su lugar.
+        local vocab_tree_args=(
+            --VocabTreeMatching.num_images "${VOCAB_TREE_NUM_IMAGES}"
+        )
+        if [ -f "${HOST_DIR}/vocab_tree.bin" ]; then
+            echo "   Vocab tree       : local (${HOST_DIR}/vocab_tree.bin)"
+            vocab_tree_args+=(--VocabTreeMatching.vocab_tree_path /working/vocab_tree.bin)
+        else
+            echo "   Vocab tree       : auto-descarga según tipo de feature"
+        fi
+        echo "   Candidatos/query : ${VOCAB_TREE_NUM_IMAGES} imágenes"
+        run_colmap vocab_tree_matcher \
+            "${match_base_args[@]}" \
+            "${vocab_tree_args[@]}"
+    else
+        run_colmap exhaustive_matcher "${match_base_args[@]}"
+    fi
+}
+
+run_roma_feature_matching() {
+    if ! run_roma_bridge; then
+        return 1
+    fi
+
+    # Ensure keypoint indices in the DB match the RoMa-generated match lists.
+    import_roma_features
+
+    run_colmap matches_importer \
+        --database_path ./database.db \
+        --match_list_path "$ROMA_BRIDGE_MATCH_LIST" \
+        --match_type "$ROMA_MATCH_TYPE"
+}
+
 # Helper to skip stages when --skip-to is set
 REACHED_STAGE=0
 should_run() {
@@ -297,36 +602,21 @@ if should_run "extraction"; then
     echo ""
     echo "[1/5] Feature Extraction..."
 
-    EXTRACT_ARGS=(
-        --database_path ./database.db
-        --image_path ./images
-        --ImageReader.camera_model "$CAMERA_MODEL"
-        --ImageReader.single_camera "$SINGLE_CAMERA"
-        --FeatureExtraction.use_gpu "$USE_GPU"
-        --FeatureExtraction.max_image_size "${MAX_IMAGE_SIZE}"
-        --SiftExtraction.max_num_features "${MAX_FEATURES}"
-        --SiftExtraction.first_octave -1
-        --SiftExtraction.num_octaves 4
-        --SiftExtraction.octave_resolution 4
-        --SiftExtraction.peak_threshold 0.004
-        --SiftExtraction.edge_threshold 10
-    )
-
-    # domain_size_pooling and estimate_affine_shape produce better features
-    # but FORCE CPU-only extraction (10-30x slower). Only enable via flag.
-    if [ "${DSP_SIFT:-0}" -eq 1 ]; then
-        EXTRACT_ARGS+=(
-            --SiftExtraction.domain_size_pooling 1
-            --SiftExtraction.estimate_affine_shape 1
-        )
-        echo "   DSP-SIFT enabled (CPU extraction, slower but better features)"
+    if [ "$FEATURE_BACKEND" = "roma" ]; then
+        echo "   Backend          : RoMaV2 bridge"
+        if run_roma_feature_extraction; then
+            echo "   RoMa features imported into database.db"
+        elif [ "$ROMA_FALLBACK" -eq 1 ]; then
+            echo "WARN: RoMa extraction backend failed, falling back to native COLMAP extractor." >&2
+            run_colmap_feature_extraction
+        else
+            echo "ERROR: RoMa extraction backend failed and fallback is disabled (--no-roma-fallback)." >&2
+            exit 1
+        fi
+    else
+        run_colmap_feature_extraction
     fi
 
-    if [ "$USE_GPU" -eq 1 ]; then
-        EXTRACT_ARGS+=(--FeatureExtraction.gpu_index 0,0,0)
-    fi
-
-    run_colmap feature_extractor "${EXTRACT_ARGS[@]}"
     echo "Feature extraction done."
 fi
 
@@ -336,50 +626,24 @@ fi
 if should_run "matching"; then
     echo ""
     echo "[2/5] Feature Matching (${MATCHER})..."
-    MATCH_BASE_ARGS=(
-        --database_path ./database.db
-        --FeatureMatching.use_gpu "$USE_GPU"
-        --SiftMatching.max_ratio 0.8
-        --FeatureMatching.max_num_matches "${MAX_MATCHES}"
-        --SiftMatching.cross_check 1
-        #--SiftMatching.guided_matching 1
-        --TwoViewGeometry.min_num_inliers 20
-        #--ExhaustiveMatching.block_size 150
-    )
 
-    if [ "$USE_GPU" -eq 1 ]; then
-        MATCH_BASE_ARGS+=(--FeatureMatching.gpu_index 0,0,0,0,0)
-    fi
-
-    if [ "$MATCHER" = "sequential" ]; then
-        run_colmap sequential_matcher \
-            "${MATCH_BASE_ARGS[@]}" \
-            --SequentialMatching.overlap "${OVERLAP}" \
-            --SequentialMatching.loop_detection 1 \
-            --SequentialMatching.loop_detection_num_images 50
-    elif [ "$MATCHER" = "vocab_tree" ]; then
-        # El vocab tree se descarga automáticamente según el tipo de feature:
-        #   ALIKED N32 → vocab_tree_faiss_flickr100K_words64K_aliked_n32.bin
-        #   SIFT       → vocab_tree_faiss_flickr100K_words256K.bin
-        # COLMAP usa GetVocabTreeUriForFeatureType() cuando vocab_tree_path está vacío
-        # (requiere DOWNLOAD_ENABLED=ON, ya compilado en la imagen).
-        # Si existe un vocab tree local en la carpeta de la serie, se usa ese en su lugar.
-        VOCAB_TREE_ARGS=(
-            --VocabTreeMatching.num_images "${VOCAB_TREE_NUM_IMAGES}"
-        )
-        if [ -f "${HOST_DIR}/vocab_tree.bin" ]; then
-            echo "   Vocab tree       : local (${HOST_DIR}/vocab_tree.bin)"
-            VOCAB_TREE_ARGS+=(--VocabTreeMatching.vocab_tree_path /working/vocab_tree.bin)
+    if [ "$MATCHING_BACKEND" = "roma" ]; then
+        echo "   Backend          : RoMaV2 bridge"
+        if run_roma_feature_matching; then
+            echo "   RoMa matches imported into database.db"
+        elif [ "$ROMA_FALLBACK" -eq 1 ]; then
+            echo "WARN: RoMa matching backend failed, falling back to native COLMAP matcher." >&2
+            echo "WARN: Re-running COLMAP feature extraction to guarantee matcher compatibility." >&2
+            run_colmap_feature_extraction
+            run_colmap_feature_matching
         else
-            echo "   Vocab tree       : auto-descarga según tipo de feature"
+            echo "ERROR: RoMa matching backend failed and fallback is disabled (--no-roma-fallback)." >&2
+            exit 1
         fi
-        echo "   Candidatos/query : ${VOCAB_TREE_NUM_IMAGES} imágenes"
-        run_colmap vocab_tree_matcher \
-            "${MATCH_BASE_ARGS[@]}" \
-            "${VOCAB_TREE_ARGS[@]}"
     else
-        run_colmap exhaustive_matcher "${MATCH_BASE_ARGS[@]}"
+        run_colmap_feature_matching
     fi
+
     echo "Feature matching done."
 fi
 
