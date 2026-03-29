@@ -47,6 +47,11 @@ set -euo pipefail
 #                          size of all depth+normal maps (~50GB for 3143 images). Prevents OOM.
 #   --fusion-cache-size N: RAM (GB) for fusion streaming cache (default: 32). Only used with --fusion-use-cache.
 #   --geom-consistency N : PatchMatchStereo geom_consistency (0 or 1, default: 1).
+#   --global-mapper      : Usar GlobalMapper (rotation+translation averaging) en lugar del mapper
+#                          incremental. Más rápido en datasets grandes y sin deriva acumulada,
+#                          pero menos robusto en escenas con poca superposición o sin calibración.
+#   --log-level N        : Nivel de verbosidad del log COLMAP (default: 0; 1=info extra; 2=debug completo).
+#                          Equivale a glog FLAGS_v; activa mensajes VLOG(N) del código interno.
 #                          1 = dos pasadas: fotométrica + geométrica → nube limpia, menos puntos (~6M).
 #                          0 = solo pasada fotométrica → más puntos (~15-18M) con más ruido en
 #                              superficies uniformes; fusión cae a photometric automáticamente.
@@ -104,6 +109,8 @@ RESUME_DENSE=0               # 1 = skip cleanup+undistorter, go straight to patc
 FUSION_USE_CACHE=1          # 1 = stream depth maps in chunks (required when RAM < ~50GB for large datasets)
 FUSION_CACHE_SIZE=32         # GB of RAM for fusion streaming cache (only used when FUSION_USE_CACHE=1)
 GEOM_CONSISTENCY=0           # 1=dos pasadas (fotométrica+geométrica, nube limpia) | 0=solo fotométrica (más puntos, más ruido)
+USE_GLOBAL_MAPPER=0          # 0=incremental mapper (default) | 1=global mapper (rotation+translation averaging)
+LOG_LEVEL=0                  # COLMAP log verbosity: 0=normal, 1=info extra, 2=debug completo
 
 HOST_DIR=$(realpath "$1")
 shift
@@ -136,6 +143,8 @@ while [[ $# -gt 0 ]]; do
         --fusion-cache-size) FUSION_CACHE_SIZE="$2";                                   shift 2 ;;
         --geom-consistency) GEOM_CONSISTENCY="$2";                                     shift 2 ;;
         --vocab-tree-num-images) VOCAB_TREE_NUM_IMAGES="$2";                           shift 2 ;;
+        --global-mapper)         USE_GLOBAL_MAPPER=1;                                 shift   ;;
+        --log-level)             LOG_LEVEL="$2";                                      shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -214,6 +223,8 @@ echo "  DSP-SIFT         : $DSP_SIFT"
 [ "$MATCHER" = "sequential" ] && echo "  Overlap          : $OVERLAP"
   echo "  BA global ratio  : ${BA_GLOBAL_FRAMES_RATIO} (COLMAP default: 1.1)"
   echo "  BA max iters     : ${BA_GLOBAL_MAX_ITER} (COLMAP default: 50)"
+  [ "$USE_GLOBAL_MAPPER" -eq 1 ] && echo "  Mapper           : GlobalMapper (rotation+translation averaging)" || echo "  Mapper           : incremental (default)"
+  echo "  Log level        : ${LOG_LEVEL} (0=normal, 1=info extra, 2=debug)"
     [ "$RUN_MESH" -eq 1 ] && echo "  Mesh generation  : ENABLED (${MESHER})"
     [ "$RUN_MESH" -eq 0 ] && echo "  Mesh generation  : DISABLED (--mesh to enable)"
   [ -n "$SKIP_TO" ] && echo "  Resuming from    : $SKIP_TO"
@@ -253,7 +264,10 @@ if [ ${#GPU_ARGS[@]} -gt 0 ]; then
 fi
 
 run_colmap() {
-    docker run "${DOCKER_BASE[@]}" "${COLMAP_IMAGE}" colmap "$@"
+    local subcmd="$1"; shift
+    docker run "${DOCKER_BASE[@]}" "${COLMAP_IMAGE}" colmap "$subcmd" \
+        --log_level "${LOG_LEVEL}" \
+        "$@"
 }
 
 # Helper to skip stages when --skip-to is set
@@ -309,7 +323,7 @@ if should_run "extraction"; then
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        EXTRACT_ARGS+=(--FeatureExtraction.gpu_index 0,0,0,0,0)
+        EXTRACT_ARGS+=(--FeatureExtraction.gpu_index 0,0,0)
     fi
 
     run_colmap feature_extractor "${EXTRACT_ARGS[@]}"
@@ -439,7 +453,19 @@ if should_run "sparse"; then
         echo "   Intrinsics       : por imagen (--no-single-camera, COLMAP refina cada cámara)"
     fi
 
-    run_colmap mapper "${MAPPER_ARGS[@]}"
+    if [ "$USE_GLOBAL_MAPPER" -eq 1 ]; then
+        GLOBAL_MAPPER_ARGS=(
+            --database_path ./database.db
+            --image_path ./images
+            --output_path ./sparse
+            --GlobalMapper.num_threads -1
+            --GlobalMapper.ba_num_iterations "${BA_GLOBAL_MAX_ITER}"
+        )
+        echo "   Mapper           : GlobalMapper (rotation+translation averaging)"
+        run_colmap global_mapper "${GLOBAL_MAPPER_ARGS[@]}"
+    else
+        run_colmap mapper "${MAPPER_ARGS[@]}"
+    fi
     echo "Sparse reconstruction done."
 fi
 
@@ -590,7 +616,7 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
     if [ "$USE_GPU" -eq 1 ]; then
         # RTX 4000 Ada: 48 SMs, ceil(1200/32)=38 bloques/imagen → óptimo ~5 threads simultáneos.
         # VRAM: 5 × 221 MB datos + 200 MB contexto = ~1.3 GB (de 20 GB disponibles).
-        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0,0,0,0,0)
+        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0,0,0)
     fi
 
     # Fallback depth bounds: required when some images have no visible sparse points.
