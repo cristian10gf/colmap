@@ -866,7 +866,7 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
         DENSE_ARGS=(
             --workspace_path ./dense/0
             --workspace_format COLMAP
-            --PatchMatchStereo.max_image_size 1200
+            --PatchMatchStereo.max_image_size ${MAX_IMAGE_SIZE}
             --PatchMatchStereo.cache_size "${CACHE_SIZE}"
             --PatchMatchStereo.num_samples 15
             --PatchMatchStereo.num_iterations 5
@@ -930,6 +930,7 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "fusion"; then
         --input_type "${FUSION_INPUT_TYPE}"
         --output_path ./dense/0/fused.ply
         --StereoFusion.num_threads 12
+        --StereoFusion.max_image_size ${MAX_IMAGE_SIZE}
     )
     if [ "$FUSION_USE_CACHE" -eq 1 ]; then
         FUSION_ARGS+=(
