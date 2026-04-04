@@ -7,9 +7,9 @@ set -euo pipefail
 # Usage: ./run-advance.sh <host_directory> [options]
 #   --cache-size GB      : VRAM for PatchMatchStereo in GB (default: 16)
 #   --max-image-size N   : Max image dimension (default: 3200)
-#   --max-features N     : Max features per image (default: 4096 ALIKED, 16384 SIFT)
-#   --max-matches N      : Max matches per pair (default: 65536)
-#   --matcher TYPE       : sequential (default, recomendado para video) | exhaustive | vocab_tree
+#   --max-features N     : Max SIFT features per image (default: 8192)
+#   --max-matches N      : Max SIFT matches per pair (default: 32768)
+#   --matcher TYPE       : sequential (default) | exhaustive | vocab_tree
 #   --overlap N          : Sequential matcher overlap (default: 20)
 #   --vocab-tree-num-images N : Nº de imágenes candidatas por query en vocab_tree matcher (default: 150).
 #                          150 cubre bien interiores con pasillos repetitivos; subir a 200+ para escenas
@@ -19,14 +19,25 @@ set -euo pipefail
 #   --mesh               : Enable mesh generation after stereo_fusion (default: disabled)
 #   --mesher TYPE        : Mesher type when --mesh is enabled: poisson (default) or delaunay
 #   --no-single-camera   : Estimate separate intrinsics per image
-#   --camera-model MODEL : Camera model (default: OPENCV). OPENCV modela distorsión tangencial (p1,p2)
-#                          además de radial (k1,k2) — mejor para lentes con barrel distortion.
-#                          Usar SIMPLE_RADIAL si la reconstrucción falla con OPENCV (modelo más simple).
+#   --camera-model MODEL : Camera model (default: SIMPLE_RADIAL)
 #   --cpu                : Force CPU mode (no GPU)
-#   --sift               : Usar SIFT + SIFT_BRUTEFORCE en lugar de ALIKED_N32 + ALIKED_LIGHTGLUE.
-#                          SIFT extrae en GPU (rápido) pero los descriptores son menos discriminativos
-#                          en pasillos repetitivos y poca luz. Usar para datasets con buena textura.
-#   --dsp                : Activar DSP-SIFT (implica --sift; extracción CPU-only, ~4-5x más lento)
+#   --feature-backend TYPE : colmap (default) | roma
+#   --matching-backend TYPE: colmap (default) | roma
+#   --roma               : Shortcut for --feature-backend roma --matching-backend roma
+#   --roma-fallback      : If RoMa backend fails, fallback to native COLMAP backend (default)
+#   --no-roma-fallback   : Disable fallback; fail fast if RoMa backend fails
+#   --roma-image TAG     : Docker image for RoMa bridge (default: roma-integration:latest)
+#   --roma-rebuild       : Rebuild RoMa image before running bridge
+#   --roma-setting NAME  : RoMaV2 setting (default: precise)
+#   --roma-match-type T  : COLMAP matches_importer type: raw (default) | inliers
+#   --roma-max-correspondences N : Requested correspondences sampled by RoMa (default: 5000)
+#   --roma-confidence-threshold F: Min RoMa overlap confidence (default: 0.2)
+#   --roma-min-correspondences N : Min correspondences to keep a pair (default: 64)
+#   --roma-max-pairs N   : Max pair count processed by RoMa (default: 0 = all)
+#   --roma-compile       : Enable torch.compile path in RoMaV2
+#   --roma-pairs-mode M  : auto (default) | sequential | exhaustive
+#   --sift               : Usar SIFT clásico en lugar de ALIKED+LightGlue (más rápido, peor en pasillos/oscuridad)
+#   --dsp                : Activar DSP-SIFT (implica --sift; extracción CPU-only, 10-30x más lento)
 #   --ba-global-ratio N  : Global BA trigger ratio (default: 1.4; COLMAP default: 1.1 = every 10%)
 #                          1.4 = every 40% of new images → ~3x less global BA rounds
 #   --ba-max-iter N      : Max iterations per global BA round (default: 30; COLMAP default: 50)
@@ -91,14 +102,20 @@ if [ $# -eq 0 ]; then
     echo "       [--skip-to extraction|matching|sparse|dense|fusion]"
     echo "       [--no-dense] [--mesh] [--mesher poisson|delaunay]"
     echo "       [--matcher sequential|exhaustive|vocab_tree]"
+    echo "       [--feature-backend colmap|roma] [--matching-backend colmap|roma]"
+    echo "       [--roma] [--no-roma-fallback] [--roma-image roma-integration:latest]"
     echo "       [--no-single-camera] [--camera-model SIMPLE_RADIAL] [--cpu]"
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/../../../..")"
+ROMA_RUN_SH="${PROJECT_ROOT}/preprocesamiento/models/roma/docker/run.sh"
+
 # --- Defaults ---
 CACHE_SIZE=32              # GB of VRAM for PatchMatchStereo
 MAX_IMAGE_SIZE=3200        # pixels (COLMAP thresholds are tuned for ~3200)
-MAX_FEATURES=""             # Auto: 4096 para ALIKED, 16384 para SIFT (override con --max-features)
+MAX_FEATURES=""         # SIFT features per image
 MAX_MATCHES=65536          # matches per image pair
 SKIP_TO=""                 # resume from this stage
 RUN_DENSE=1
@@ -106,26 +123,36 @@ RUN_MESH=0
 OVERWRITE=1
 MESHER="poisson"
 MATCHER="exhaustive"       # sequential | exhaustive | vocab_tree
-                           # sequential es preferible para video de interiores: solo matchea vecinos
-                           # temporales + loop detection, eliminando la mayoría de falsos positivos
-                           # cross-piso/pasillo que el exhaustive genera con O(N²) pares.
 OVERLAP=20                 # overlap for sequential matcher (10 sufficient for 2 FPS video; was 20)
 VOCAB_TREE_NUM_IMAGES=150  # candidatos por query en vocab_tree matcher (150 cubre bien interiores)
 SINGLE_CAMERA=1            # all frames share intrinsics (same camera/video)
-CAMERA_MODEL="OPENCV"         # COLMAP camera model. OPENCV (fx,fy,cx,cy,k1,k2,p1,p2) modela distorsión tangencial — mejor para
-                              # lentes de smartphone/acción con barrel distortion. SIMPLE_RADIAL solo tiene k1.
-                              # Con single_camera=1 el overhead en BA es despreciable (parámetros compartidos).
+CAMERA_MODEL="SIMPLE_RADIAL"  # COLMAP camera model (default: SIMPLE_RADIAL, good for most smartphone cameras; use OPENCV for more complex lenses)
 FORCE_CPU=0
-USE_SIFT=1                 # 0=ALIKED_N32+LightGlue (default, mejor para indoor/pasillos/poca luz)
-                           # 1=SIFT clásico (más rápido extracción GPU, peor en texturas repetitivas)
+USE_SIFT=1                   # Usar SIFT clásico en lugar de ALIKED+LightGlue (más rápido, peor en pasillos/oscuridad)
 DSP_SIFT=1                 # DSP-SIFT: better features but forces CPU extraction (10-30x slower)
 NUM_CPUS_OVERRIDE=""         # override nproc with --cpus N
+FEATURE_BACKEND="colmap"   # colmap | roma
+MATCHING_BACKEND="colmap"  # colmap | roma
+ROMA_FALLBACK=1            # 1=fallback to colmap if RoMa fails
+ROMA_IMAGE="roma-integration:latest"
+ROMA_REBUILD=0
+ROMA_SETTING="precise"
+ROMA_MATCH_TYPE="raw"      # raw | inliers
+ROMA_MAX_CORRESPONDENCES=5000
+ROMA_CONFIDENCE_THRESHOLD=0.2
+ROMA_MIN_CORRESPONDENCES=64
+ROMA_MAX_PAIRS=0
+ROMA_COMPILE=0
+ROMA_PAIRS_MODE="auto"     # auto | sequential | exhaustive
+ROMA_BRIDGE_RAN=0
+ROMA_FEATURES_IMPORTED=0
+ROMA_BRIDGE_MATCH_LIST=""
 
 # --- Bundle Adjustment (Mapper) ---
 # COLMAP default for ba_global_*_ratio is 1.1 (triggers global BA every 10% new images/points).
 # With 1800 images this causes ~16 global BA rounds, each failing with dense Cholesky on CPU.
 # Fix: use GPU solver (ba_use_gpu) + reduce frequency (ratio 1.1 = every 10% = ~16 rounds).
-BA_GLOBAL_FRAMES_RATIO=1.2   # COLMAP default: 1.1
+BA_GLOBAL_FRAMES_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_POINTS_RATIO=1.1   # COLMAP default: 1.1
 BA_GLOBAL_MAX_ITER=50        # COLMAP default: 50 — fewer iterations per global BA round
 BA_GLOBAL_MAX_REFINEMENTS=5  # Safety default: avoids global-refinement crash when mapper temporarily drops to <2 registered images.
@@ -175,16 +202,31 @@ while [[ $# -gt 0 ]]; do
         --overlap)          OVERLAP="$2";         shift 2 ;;
         --no-single-camera) SINGLE_CAMERA=0;      shift   ;;
         --camera-model)     CAMERA_MODEL="$2";    shift 2 ;;
-        --cpu)              FORCE_CPU=1;          shift   ;;
-        --cpus)             NUM_CPUS_OVERRIDE="$2"; shift 2 ;;
-        --sift)             USE_SIFT=1;           shift   ;;
-        --dsp)              DSP_SIFT=1; USE_SIFT=1; shift   ;;
-        --ba-global-ratio)  BA_GLOBAL_FRAMES_RATIO="$2"; BA_GLOBAL_POINTS_RATIO="$2"; shift 2 ;;
-        --ba-max-iter)      BA_GLOBAL_MAX_ITER="$2";                                  shift 2 ;;
+        --cpu)              FORCE_CPU=1;          shift   ;; 
         --ba-max-refinements) BA_GLOBAL_MAX_REFINEMENTS="$2";                         shift 2 ;;
         --ba-gpu-min-images) BA_GPU_MIN_NUM_IMAGES="$2";                              shift 2 ;;
         --ba-gpu-max-direct-dense) BA_GPU_MAX_NUM_IMAGES_DIRECT_DENSE="$2";           shift 2 ;;
         --ba-gpu-max-direct-sparse) BA_GPU_MAX_NUM_IMAGES_DIRECT_SPARSE="$2";         shift 2 ;;
+        --feature-backend)  FEATURE_BACKEND="$2"; shift 2 ;;
+        --matching-backend) MATCHING_BACKEND="$2"; shift 2 ;;
+        --roma)             FEATURE_BACKEND="roma"; MATCHING_BACKEND="roma"; shift ;;
+        --roma-fallback)    ROMA_FALLBACK=1; shift ;;
+        --no-roma-fallback) ROMA_FALLBACK=0; shift ;;
+        --roma-image)       ROMA_IMAGE="$2"; shift 2 ;;
+        --roma-rebuild)     ROMA_REBUILD=1; shift ;;
+        --roma-setting)     ROMA_SETTING="$2"; shift 2 ;;
+        --roma-match-type)  ROMA_MATCH_TYPE="$2"; shift 2 ;;
+        --roma-max-correspondences) ROMA_MAX_CORRESPONDENCES="$2"; shift 2 ;;
+        --roma-confidence-threshold) ROMA_CONFIDENCE_THRESHOLD="$2"; shift 2 ;;
+        --roma-min-correspondences) ROMA_MIN_CORRESPONDENCES="$2"; shift 2 ;;
+        --roma-max-pairs)   ROMA_MAX_PAIRS="$2"; shift 2 ;;
+        --roma-compile)     ROMA_COMPILE=1; shift ;;
+        --roma-pairs-mode)  ROMA_PAIRS_MODE="$2"; shift 2 ;;
+        --cpus)             NUM_CPUS_OVERRIDE="$2"; shift 2 ;;
+        --sift)            USE_SIFT=1;           shift   ;;
+        --dsp)              DSP_SIFT=1;           shift   ;;
+        --ba-global-ratio)  BA_GLOBAL_FRAMES_RATIO="$2"; BA_GLOBAL_POINTS_RATIO="$2"; shift 2 ;;
+        --ba-max-iter)      BA_GLOBAL_MAX_ITER="$2";                                  shift 2 ;;
         --refine-intrinsics) BA_REFINE_INTRINSICS=1;                                  shift   ;;
         --fast-dense)       FAST_DENSE=1;                                              shift   ;;
         --depth-min)        DEPTH_MIN="$2";                                            shift 2 ;;
@@ -211,6 +253,53 @@ if [ -z "$MAX_FEATURES" ]; then
         MAX_FEATURES=16384
     else
         MAX_FEATURES=4096
+    fi
+fi
+
+case "$FEATURE_BACKEND" in
+    colmap|roma) ;;
+    *)
+        echo "Error: --feature-backend must be colmap or roma (got '$FEATURE_BACKEND')."
+        exit 1
+        ;;
+esac
+
+case "$MATCHING_BACKEND" in
+    colmap|roma) ;;
+    *)
+        echo "Error: --matching-backend must be colmap or roma (got '$MATCHING_BACKEND')."
+        exit 1
+        ;;
+esac
+
+if [ "$FEATURE_BACKEND" != "$MATCHING_BACKEND" ]; then
+    echo "Error: use the same backend for extraction and matching."
+    echo "  Supported combos:"
+    echo "    --feature-backend colmap --matching-backend colmap"
+    echo "    --feature-backend roma --matching-backend roma"
+    exit 1
+fi
+
+case "$ROMA_MATCH_TYPE" in
+    raw|inliers) ;;
+    *)
+        echo "Error: --roma-match-type must be raw or inliers (got '$ROMA_MATCH_TYPE')."
+        exit 1
+        ;;
+esac
+
+case "$ROMA_PAIRS_MODE" in
+    auto|sequential|exhaustive) ;;
+    *)
+        echo "Error: --roma-pairs-mode must be auto, sequential or exhaustive (got '$ROMA_PAIRS_MODE')."
+        exit 1
+        ;;
+esac
+
+if [ "$FEATURE_BACKEND" = "roma" ] || [ "$MATCHING_BACKEND" = "roma" ]; then
+    if [ ! -x "$ROMA_RUN_SH" ]; then
+        echo "Error: RoMa bridge runner not found or not executable: $ROMA_RUN_SH"
+        exit 1
     fi
 fi
 
@@ -351,6 +440,14 @@ echo "  GPU              : $USE_GPU"
 if [ "$USE_GPU" -eq 1 ]; then
     echo "  GPU VRAM total   : ${GPU_TOTAL_MIB} MiB"
 fi
+echo "  Feature backend  : $FEATURE_BACKEND"
+echo "  Matching backend : $MATCHING_BACKEND"
+if [ "$FEATURE_BACKEND" = "roma" ] || [ "$MATCHING_BACKEND" = "roma" ]; then
+    echo "  RoMa fallback    : $ROMA_FALLBACK"
+    echo "  RoMa image       : $ROMA_IMAGE"
+    echo "  RoMa setting     : $ROMA_SETTING"
+    echo "  RoMa match type  : $ROMA_MATCH_TYPE"
+fi
 echo "  Matcher          : $MATCHER"
 echo "  Camera model     : $CAMERA_MODEL"
 echo "  Single camera    : $SINGLE_CAMERA"
@@ -438,34 +535,105 @@ get_model_reproj_error() {
         '
 }
 
-# Helper to skip stages when --skip-to is set
-REACHED_STAGE=0
-should_run() {
-    local stage="$1"
-    if [ -z "$SKIP_TO" ]; then
-        return 0
+resolve_roma_pairs_mode() {
+    if [ "$ROMA_PAIRS_MODE" != "auto" ]; then
+        echo "$ROMA_PAIRS_MODE"
+        return
     fi
-    if [ "$stage" = "$SKIP_TO" ]; then
-        REACHED_STAGE=1
+
+    if [ "$MATCHER" = "sequential" ]; then
+        echo "sequential"
+    else
+        # vocab_tree has no direct RoMa pairing equivalent; exhaustive gives global coverage.
+        echo "exhaustive"
     fi
-    if [ "$REACHED_STAGE" -eq 1 ]; then
-        return 0
-    fi
-    echo "  Skipping stage: $stage"
-    return 1
 }
 
-mkdir -p "${HOST_DIR}/sparse"
-[ "$RUN_DENSE" -eq 1 ] && mkdir -p "${HOST_DIR}/dense/0"
+run_roma_bridge() {
+    if [ "$ROMA_BRIDGE_RAN" -eq 1 ]; then
+        return 0
+    fi
 
-# =============================================
-# STAGE 1: Feature Extraction
-# =============================================
-if should_run "extraction"; then
-    echo ""
-    echo "[1/5] Feature Extraction..."
+    local pairs_mode
+    pairs_mode="$(resolve_roma_pairs_mode)"
 
-    EXTRACT_ARGS=(
+    local bridge_args=()
+    bridge_args+=(--pairs-mode "$pairs_mode")
+    bridge_args+=(--setting "$ROMA_SETTING")
+    bridge_args+=(--match-type "$ROMA_MATCH_TYPE")
+    bridge_args+=(--max-correspondences "$ROMA_MAX_CORRESPONDENCES")
+    bridge_args+=(--confidence-threshold "$ROMA_CONFIDENCE_THRESHOLD")
+    bridge_args+=(--min-correspondences "$ROMA_MIN_CORRESPONDENCES")
+
+    if [ "$pairs_mode" = "sequential" ]; then
+        bridge_args+=(--sequential-overlap "$OVERLAP")
+    fi
+    if [ "$ROMA_MAX_PAIRS" -gt 0 ]; then
+        bridge_args+=(--max-pairs "$ROMA_MAX_PAIRS")
+    fi
+    if [ "$ROMA_COMPILE" -eq 1 ]; then
+        bridge_args+=(--compile)
+    else
+        bridge_args+=(--no-compile)
+    fi
+
+    local roma_args=("$HOST_DIR" --image "$ROMA_IMAGE")
+    if [ "$ROMA_REBUILD" -eq 1 ]; then
+        roma_args+=(--rebuild)
+    fi
+    if [ "$FORCE_CPU" -eq 1 ]; then
+        roma_args+=(--cpu)
+    fi
+    roma_args+=(--)
+    roma_args+=("${bridge_args[@]}")
+
+    echo "   RoMa bridge      : running (${pairs_mode}, setting=${ROMA_SETTING})"
+    if ! "$ROMA_RUN_SH" "${roma_args[@]}"; then
+        return 1
+    fi
+
+    local match_list_host
+    if [ "$ROMA_MATCH_TYPE" = "inliers" ]; then
+        match_list_host="${HOST_DIR}/roma/matches_inliers.txt"
+        ROMA_BRIDGE_MATCH_LIST="./roma/matches_inliers.txt"
+    else
+        match_list_host="${HOST_DIR}/roma/matches_raw.txt"
+        ROMA_BRIDGE_MATCH_LIST="./roma/matches_raw.txt"
+    fi
+
+    if [ ! -d "${HOST_DIR}/roma/features" ]; then
+        echo "ERROR: RoMa bridge finished but roma/features is missing." >&2
+        return 1
+    fi
+    if [ ! -s "$match_list_host" ]; then
+        echo "ERROR: RoMa bridge finished but match list is missing or empty: $match_list_host" >&2
+        return 1
+    fi
+
+    ROMA_BRIDGE_RAN=1
+    return 0
+}
+
+import_roma_features() {
+    if [ "$ROMA_FEATURES_IMPORTED" -eq 1 ]; then
+        return 0
+    fi
+
+    if [ ! -f "${HOST_DIR}/database.db" ]; then
+        run_colmap database_creator --database_path ./database.db
+    fi
+
+    run_colmap feature_importer \
+        --database_path ./database.db \
+        --image_path ./images \
+        --import_path ./roma/features
+
+    ROMA_FEATURES_IMPORTED=1
+    return 0
+}
+
+run_colmap_feature_extraction() {
+    local EXTRACT_ARGS=(
         --database_path ./database.db
         --image_path ./images
         --ImageReader.camera_model "$CAMERA_MODEL"
@@ -487,8 +655,10 @@ if should_run "extraction"; then
             --SiftExtraction.octave_resolution 4
             # peak_threshold=0.0055: filtra features de bajo contraste en
             # paredes lisas (default COLMAP: 0.0067).
-            --SiftExtraction.peak_threshold 0.0055
+            --SiftExtraction.peak_threshold 0.004
             --SiftExtraction.edge_threshold 10
+
+            
             --SiftExtraction.max_num_orientations 2
             --SiftExtraction.upright 0
         )
@@ -499,6 +669,8 @@ if should_run "extraction"; then
             EXTRACT_ARGS+=(
                 --SiftExtraction.domain_size_pooling 1
                 --SiftExtraction.estimate_affine_shape 1
+
+                # Parámetros DSP-SIFT recomendados (ajustables según el dataset):
                 --SiftExtraction.dsp_num_scales 10
                 --SiftExtraction.dsp_min_scale 0.166667
                 --SiftExtraction.dsp_max_scale 4
@@ -534,7 +706,6 @@ if should_run "extraction"; then
         fi
     fi
 
-
     # Tolerate extractor failures (e.g., one corrupt image or transient OOM) and
     # continue if the database still contains a usable amount of keypoints.
     set +e
@@ -568,22 +739,25 @@ if should_run "extraction"; then
     else
         echo "Feature extraction done (${KEYPOINT_IMAGES_NONZERO} imágenes con keypoints, filas keypoints=${KEYPOINT_ROWS})."
     fi
-fi
+}
 
-# =============================================
-# STAGE 2: Feature Matching
-# =============================================
-if should_run "matching"; then
-    echo ""
-    echo "[2/5] Feature Matching (${MATCHER})..."
-    # --- Argumentos comunes a todos los feature types ---
-    MATCH_BASE_ARGS=(
+run_roma_feature_extraction() {
+    if ! run_roma_bridge; then
+        return 1
+    fi
+    import_roma_features
+}
+
+run_colmap_feature_matching() {
+    local match_base_args=(
         --database_path ./database.db
         --FeatureMatching.use_gpu "$USE_GPU"
         --FeatureMatching.max_num_matches "${MAX_MATCHES}"
         # min_num_inliers: pares cross-piso/pasillo frecuentemente pasan la verificación geométrica
         # con 15-25 inliers. 35 exige más evidencia para aceptar un par.
-        --TwoViewGeometry.min_num_inliers 35
+        --TwoViewGeometry.min_num_inliers 20
+
+        # Nuevos parametros -----------------------------------
         # RANSAC geométrico: aplica a todos los feature types (SIFT, ALIKED, LightGlue).
         --TwoViewGeometry.confidence 0.999
         --TwoViewGeometry.max_num_trials 20000
@@ -597,7 +771,7 @@ if should_run "matching"; then
             --FeatureMatching.guided_matching 1
             # Lowe's ratio test: 0.70 = restrictivo. En escenas repetitivas el 2° mejor
             # match viene de un pasillo/piso diferente (ratio ≈ 0.9-1.0) → rechazado.
-            --SiftMatching.max_ratio 0.70
+            --SiftMatching.max_ratio 0.8
             --SiftMatching.max_distance 0.6
             --SiftMatching.cross_check 1
         )
@@ -613,14 +787,12 @@ if should_run "matching"; then
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        # gpu_index: nº de workers GPU. 2 workers es seguro para 20GB VRAM.
-        # LightGlue usa más VRAM que brute force — mantener 2 workers.
-        MATCH_BASE_ARGS+=(--FeatureMatching.gpu_index 0,0)
+        match_base_args+=(--FeatureMatching.gpu_index 0,0)
     fi
 
     if [ "$MATCHER" = "sequential" ]; then
         run_colmap sequential_matcher \
-            "${MATCH_BASE_ARGS[@]}" \
+            "${match_base_args[@]}" \
             --SequentialMatching.overlap "${OVERLAP}" \
             --SequentialMatching.loop_detection 1 \
             --SequentialMatching.loop_detection_num_images 50
@@ -631,30 +803,107 @@ if should_run "matching"; then
         # COLMAP usa GetVocabTreeUriForFeatureType() cuando vocab_tree_path está vacío
         # (requiere DOWNLOAD_ENABLED=ON, ya compilado en la imagen).
         # Si existe un vocab tree local en la carpeta de la serie, se usa ese en su lugar.
-        VOCAB_TREE_ARGS=(
+        local vocab_tree_args=(
             --VocabTreeMatching.num_images "${VOCAB_TREE_NUM_IMAGES}"
         )
         if [ -f "${HOST_DIR}/vocab_tree.bin" ]; then
             echo "   Vocab tree       : local (${HOST_DIR}/vocab_tree.bin)"
-            VOCAB_TREE_ARGS+=(--VocabTreeMatching.vocab_tree_path /working/vocab_tree.bin)
+            vocab_tree_args+=(--VocabTreeMatching.vocab_tree_path /working/vocab_tree.bin)
         else
             echo "   Vocab tree       : auto-descarga según tipo de feature"
         fi
         echo "   Candidatos/query : ${VOCAB_TREE_NUM_IMAGES} imágenes"
         run_colmap vocab_tree_matcher \
-            "${MATCH_BASE_ARGS[@]}" \
-            "${VOCAB_TREE_ARGS[@]}"
+            "${match_base_args[@]}" \
+            "${vocab_tree_args[@]}"
     else
-        # ExhaustiveMatching.block_size (default COLMAP: 50): cuántas imágenes se cargan en GPU/batch.
-        # Solo aplica al exhaustive_matcher (sequential y vocab_tree no aceptan este flag).
-        # El trabajo total es siempre O(N²) — block_size solo afecta la presión de VRAM.
-        #   50  →  2.500 pares/batch  (conservador, seguro para GPUs <8GB)
-        #   70  →  4.900 pares/batch  (buen balance para GPUs 8-16GB)
-        #   100 → 10.000 pares/batch  (para GPUs >16GB con datasets grandes)
-        run_colmap exhaustive_matcher \
-            "${MATCH_BASE_ARGS[@]}" \
-            --ExhaustiveMatching.block_size 50
+        run_colmap exhaustive_matcher "${match_base_args[@]}"
     fi
+}
+
+run_roma_feature_matching() {
+    if ! run_roma_bridge; then
+        return 1
+    fi
+
+    # Ensure keypoint indices in the DB match the RoMa-generated match lists.
+    import_roma_features
+
+    run_colmap matches_importer \
+        --database_path ./database.db \
+        --match_list_path "$ROMA_BRIDGE_MATCH_LIST" \
+        --match_type "$ROMA_MATCH_TYPE"
+}
+
+# Helper to skip stages when --skip-to is set
+REACHED_STAGE=0
+should_run() {
+    local stage="$1"
+    if [ -z "$SKIP_TO" ]; then
+        return 0
+    fi
+    if [ "$stage" = "$SKIP_TO" ]; then
+        REACHED_STAGE=1
+    fi
+    if [ "$REACHED_STAGE" -eq 1 ]; then
+        return 0
+    fi
+    echo "  Skipping stage: $stage"
+    return 1
+}
+
+mkdir -p "${HOST_DIR}/sparse"
+[ "$RUN_DENSE" -eq 1 ] && mkdir -p "${HOST_DIR}/dense/0"
+
+# =============================================
+# STAGE 1: Feature Extraction
+# =============================================
+if should_run "extraction"; then
+    echo ""
+    echo "[1/5] Feature Extraction..."
+
+    if [ "$FEATURE_BACKEND" = "roma" ]; then
+        echo "   Backend          : RoMaV2 bridge"
+        if run_roma_feature_extraction; then
+            echo "   RoMa features imported into database.db"
+        elif [ "$ROMA_FALLBACK" -eq 1 ]; then
+            echo "WARN: RoMa extraction backend failed, falling back to native COLMAP extractor." >&2
+            run_colmap_feature_extraction
+        else
+            echo "ERROR: RoMa extraction backend failed and fallback is disabled (--no-roma-fallback)." >&2
+            exit 1
+        fi
+    else
+        run_colmap_feature_extraction
+    fi
+
+    echo "Feature extraction done."
+fi
+
+# =============================================
+# STAGE 2: Feature Matching
+# =============================================
+if should_run "matching"; then
+    echo ""
+    echo "[2/5] Feature Matching (${MATCHER})..."
+
+    if [ "$MATCHING_BACKEND" = "roma" ]; then
+        echo "   Backend          : RoMaV2 bridge"
+        if run_roma_feature_matching; then
+            echo "   RoMa matches imported into database.db"
+        elif [ "$ROMA_FALLBACK" -eq 1 ]; then
+            echo "WARN: RoMa matching backend failed, falling back to native COLMAP matcher." >&2
+            echo "WARN: Re-running COLMAP feature extraction to guarantee matcher compatibility." >&2
+            run_colmap_feature_extraction
+            run_colmap_feature_matching
+        else
+            echo "ERROR: RoMa matching backend failed and fallback is disabled (--no-roma-fallback)." >&2
+            exit 1
+        fi
+    else
+        run_colmap_feature_matching
+    fi
+
     echo "Feature matching done."
 fi
 
@@ -700,6 +949,8 @@ if should_run "sparse"; then
         --Mapper.ba_global_ignore_redundant_points3D 1
         # --- Use all CPU threads for triangulation/registration ---
         --Mapper.num_threads -1
+
+        # Adicionales   --------------------
         # --- BA local: más imágenes e iteraciones para mejor consistencia local ---
         # ba_local_num_images=10: incluye más contexto en BA local (default: 6, antes: 8).
         --Mapper.ba_local_num_images 15
@@ -737,7 +988,7 @@ if should_run "sparse"; then
     if [ "$USE_GPU" -eq 1 ]; then
         MAPPER_ARGS+=(
             --Mapper.ba_use_gpu 1
-            --Mapper.ba_gpu_index 0,0,0
+            --Mapper.ba_gpu_index 0
             --Mapper.ba_refine_principal_point 1
             --Mapper.ba_min_num_residuals_for_cpu_multi_threading 50000
         )
@@ -984,7 +1235,7 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
         DENSE_ARGS=(
             --workspace_path ./dense/0
             --workspace_format COLMAP
-            --PatchMatchStereo.max_image_size 1200
+            --PatchMatchStereo.max_image_size ${MAX_IMAGE_SIZE}
             --PatchMatchStereo.cache_size "${CACHE_SIZE}"
             --PatchMatchStereo.num_samples 15
             --PatchMatchStereo.num_iterations 5
@@ -1048,6 +1299,7 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "fusion"; then
         --input_type "${FUSION_INPUT_TYPE}"
         --output_path ./dense/0/fused.ply
         --StereoFusion.num_threads 12
+        --StereoFusion.max_image_size ${MAX_IMAGE_SIZE}
     )
     if [ "$FUSION_USE_CACHE" -eq 1 ]; then
         FUSION_ARGS+=(
