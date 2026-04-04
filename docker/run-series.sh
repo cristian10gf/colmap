@@ -119,6 +119,14 @@ if [ ! -d "$IMAGES_DIR" ]; then
     exit 1
 fi
 
+# --- Logging ---
+# Redirige toda la salida del pipeline (stdout + stderr) a un .log en la carpeta de la serie.
+# El nombre incluye timestamp para no sobreescribir ejecuciones anteriores.
+LOG_FILE="${SERIES_DIR}/colmap_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "Log guardado en: $LOG_FILE"
+echo "Inicio: $(date '+%Y-%m-%d %H:%M:%S')"
+
 if [ "$FORCE_CONTEXT_DEFAULT" -eq 1 ]; then
     docker context use default
 fi
@@ -249,3 +257,5 @@ echo "Resultados   : $SERIES_DIR"
 echo ""
 
 run_with_docker_hint docker run "${DOCKER_ARGS[@]}" "$COLMAP_IMAGE" colmap "${AUTO_ARGS[@]}"
+echo ""
+echo "Fin: $(date '+%Y-%m-%d %H:%M:%S') — Log: $LOG_FILE"

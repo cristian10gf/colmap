@@ -150,6 +150,12 @@ class AlikedFeatureExtractor : public FeatureExtractor {
                        model_.output_shapes()[1],
                        {-1, -1, -1});
     descriptor_dim_ = static_cast<int>(model_.output_shapes()[1][2]);
+    if (descriptor_dim_ <= 0) {
+      // El modelo ONNX exporta las dimensiones del descriptor como dinámicas (-1).
+      // Usamos el valor fijo de la arquitectura: N32=256-dim, N16ROT=128-dim.
+      descriptor_dim_ =
+          (options.type == FeatureExtractorType::ALIKED_N32) ? 256 : 128;
+    }
     THROW_CHECK_GT(descriptor_dim_, 0);
     VLOG(2) << "ALIKED descriptor dimension: " << descriptor_dim_;
     ThrowCheckONNXNode(model_.output_names()[2],
