@@ -128,8 +128,8 @@ VOCAB_TREE_NUM_IMAGES=150  # candidatos por query en vocab_tree matcher (150 cub
 SINGLE_CAMERA=1            # all frames share intrinsics (same camera/video)
 CAMERA_MODEL="SIMPLE_RADIAL"  # COLMAP camera model (default: SIMPLE_RADIAL, good for most smartphone cameras; use OPENCV for more complex lenses)
 FORCE_CPU=0
-USE_SIFT=1                   # Usar SIFT clásico en lugar de ALIKED+LightGlue (más rápido, peor en pasillos/oscuridad)
-DSP_SIFT=1                 # DSP-SIFT: better features but forces CPU extraction (10-30x slower)
+USE_SIFT=0                   # Usar SIFT clásico en lugar de ALIKED+LightGlue (más rápido, peor en pasillos/oscuridad)
+DSP_SIFT=0                 # DSP-SIFT: better features but forces CPU extraction (10-30x slower)
 NUM_CPUS_OVERRIDE=""         # override nproc with --cpus N
 FEATURE_BACKEND="colmap"   # colmap | roma
 MATCHING_BACKEND="colmap"  # colmap | roma
@@ -749,7 +749,7 @@ run_roma_feature_extraction() {
 }
 
 run_colmap_feature_matching() {
-    local match_base_args=(
+    local MATCH_BASE_ARGS=(
         --database_path ./database.db
         --FeatureMatching.use_gpu "$USE_GPU"
         --FeatureMatching.max_num_matches "${MAX_MATCHES}"
@@ -787,12 +787,12 @@ run_colmap_feature_matching() {
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
-        match_base_args+=(--FeatureMatching.gpu_index 0,0)
+        MATCH_BASE_ARGS+=(--FeatureMatching.gpu_index 0,0)
     fi
 
     if [ "$MATCHER" = "sequential" ]; then
         run_colmap sequential_matcher \
-            "${match_base_args[@]}" \
+            "${MATCH_BASE_ARGS[@]}" \
             --SequentialMatching.overlap "${OVERLAP}" \
             --SequentialMatching.loop_detection 1 \
             --SequentialMatching.loop_detection_num_images 50
@@ -814,10 +814,10 @@ run_colmap_feature_matching() {
         fi
         echo "   Candidatos/query : ${VOCAB_TREE_NUM_IMAGES} imágenes"
         run_colmap vocab_tree_matcher \
-            "${match_base_args[@]}" \
+            "${MATCH_BASE_ARGS[@]}" \
             "${vocab_tree_args[@]}"
     else
-        run_colmap exhaustive_matcher "${match_base_args[@]}"
+        run_colmap exhaustive_matcher "${MATCH_BASE_ARGS[@]}"
     fi
 }
 
