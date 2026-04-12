@@ -124,7 +124,7 @@ OVERWRITE=1
 MESHER="poisson"
 MATCHER="exhaustive"       # sequential | exhaustive | vocab_tree
 OVERLAP=20                 # overlap for sequential matcher (10 sufficient for 2 FPS video; was 20)
-VOCAB_TREE_NUM_IMAGES=150  # candidatos por query en vocab_tree matcher (150 cubre bien interiores)
+VOCAB_TREE_NUM_IMAGES=200  # candidatos por query en vocab_tree matcher (150 cubre bien interiores)
 SINGLE_CAMERA=1            # all frames share intrinsics (same camera/video)
 CAMERA_MODEL="SIMPLE_RADIAL"  # COLMAP camera model (default: SIMPLE_RADIAL, good for most smartphone cameras; use OPENCV for more complex lenses)
 FORCE_CPU=0
@@ -161,23 +161,23 @@ BA_GPU_MIN_NUM_IMAGES=50
 BA_GPU_MAX_NUM_IMAGES_DIRECT_DENSE=200
 BA_GPU_MAX_NUM_IMAGES_DIRECT_SPARSE=4000
 FAST_DENSE=0                 # 0=quality dense (default) | 1=fast dense (~4-5x faster)
-DEPTH_MIN=0.1                    # -1 = auto from sparse; set >0 as fallback for images with no sparse points
-DEPTH_MAX=100.0                 # -1 = auto from sparse; set >0 as fallback
+DEPTH_MIN=-1                    # -1 = auto from sparse; set >0 as fallback for images with no sparse points
+DEPTH_MAX=-1                 # -1 = auto from sparse; set >0 as fallback
 RESUME_DENSE=0               # 1 = skip cleanup+undistorter, go straight to patch_match_stereo
 FUSION_USE_CACHE=1          # 1 = stream depth maps in chunks (required when RAM < ~50GB for large datasets)
 FUSION_CACHE_SIZE=32         # GB of RAM for fusion streaming cache (only used when FUSION_USE_CACHE=1)
-GEOM_CONSISTENCY=0           # 1=dos pasadas (fotométrica+geométrica, nube limpia) | 0=solo fotométrica (más puntos, más ruido)
+GEOM_CONSISTENCY=1           # 1=dos pasadas (fotométrica+geométrica, nube limpia) | 0=solo fotométrica (más puntos, más ruido)
 USE_GLOBAL_MAPPER=0          # 0=incremental mapper (default) | 1=global mapper (rotation+translation averaging)
 USE_HIERARCHICAL_MAPPER=0    # 0=incremental (default) | 1=hierarchical mapper (sub-modelos con overlap, luego fusión)
                              #   Mejor para datasets muy grandes (>1500 imágenes); requiere overlap entre zonas.
                              #   Si los sub-modelos no fusionan → se usa el mayor como fallback.
-MAPPER_MAX_REG_TRIALS=4            # Reintentos máximos por imagen durante el registro incremental.
+MAPPER_MAX_REG_TRIALS=3            # Reintentos máximos por imagen durante el registro incremental.
                                    # COLMAP default: 3. Aumentar ayuda en transiciones difíciles
                                    # (giros bruscos, escaleras) sin afectar el parseo en COLMAP 3.14.
 MAPPER_INIT_MIN_TRI_ANGLE=16      # Ángulo mínimo de triangulación para el par inicial (COLMAP default: 16°).
                                    # 10° es un buen balance para pasillos indoor con baseline corta.
                                    # 8° era demasiado agresivo. Valores <4° producen geometría degenerada.
-LOG_LEVEL=1                  # COLMAP log verbosity: 0=normal, 1=info extra, 2=debug completo
+LOG_LEVEL=2                  # COLMAP log verbosity: 0=normal, 1=info extra, 2=debug completo
 
 # --- Merge quality guard ---
 # If merged model quality is much worse than the anchor model, prefer anchor.
@@ -527,8 +527,12 @@ get_model_reproj_error() {
         --path "$model_path" 2>/dev/null \
         | awk '
             /Mean reprojection error:/ {
-                if (match($0, /Mean reprojection error: ([0-9.eE+-]+)/, m)) {
-                    print m[1]
+                # POSIX-awk compatible parser (mawk does not support match(..., ..., array)).
+                line = $0
+                sub(/^.*Mean reprojection error:[[:space:]]*/, "", line)
+                split(line, parts, /[[:space:]]+/)
+                if (parts[1] != "") {
+                    print parts[1]
                     exit
                 }
             }
@@ -694,7 +698,7 @@ run_colmap_feature_extraction() {
         # aproximadamente en orientación vertical (landscape normal).
         echo "   Extractor: ALIKED_N32 + LightGlue (default)"
         EXTRACT_ARGS+=(
-            --FeatureExtraction.type ALIKED_N32
+            --FeatureExtraction.type ALIKED_N16ROT
             # max_num_features: ALIKED default es 2048, subimos a 4096 para indoor
             # donde más features ayudan con texturas repetitivas y transiciones.
             # No subir a 8192+ — ALIKED features son más discriminativos que SIFT
@@ -702,7 +706,7 @@ run_colmap_feature_extraction() {
             --AlikedExtraction.max_num_features "${MAX_FEATURES}"
         )
         if [ "$USE_GPU" -eq 1 ]; then
-            EXTRACT_ARGS+=(--FeatureExtraction.gpu_index 0,0)
+            EXTRACT_ARGS+=(--FeatureExtraction.gpu_index 0)
         fi
     fi
 
@@ -760,9 +764,9 @@ run_colmap_feature_matching() {
         # Nuevos parametros -----------------------------------
         # RANSAC geométrico: aplica a todos los feature types (SIFT, ALIKED, LightGlue).
         --TwoViewGeometry.confidence 0.999
-        --TwoViewGeometry.max_num_trials 20000
-        --TwoViewGeometry.max_error 2.5
-        --TwoViewGeometry.min_inlier_ratio 0.25
+        #--TwoViewGeometry.max_num_trials 10000
+        #--TwoViewGeometry.max_error 2.5
+        #--TwoViewGeometry.min_inlier_ratio 0.25
     )
 
     if [ "$USE_SIFT" -eq 1 ]; then
@@ -795,7 +799,7 @@ run_colmap_feature_matching() {
             "${MATCH_BASE_ARGS[@]}" \
             --SequentialMatching.overlap "${OVERLAP}" \
             --SequentialMatching.loop_detection 1 \
-            --SequentialMatching.loop_detection_num_images 50
+            --SequentialMatching.loop_detection_num_images 200
     elif [ "$MATCHER" = "vocab_tree" ]; then
         # El vocab tree se descarga automáticamente según el tipo de feature:
         #   ALIKED N32 → vocab_tree_faiss_flickr100K_words64K_aliked_n32.bin
@@ -946,20 +950,20 @@ if should_run "sparse"; then
         --Mapper.ba_global_max_num_iterations "${BA_GLOBAL_MAX_ITER}"
         --Mapper.ba_global_max_refinements "${BA_GLOBAL_MAX_REFINEMENTS}"
         # --- Prune redundant 3D points before each BA round (reduces problem size) ---
-        --Mapper.ba_global_ignore_redundant_points3D 1
+        --Mapper.ba_global_ignore_redundant_points3D 0
         # --- Use all CPU threads for triangulation/registration ---
         --Mapper.num_threads -1
 
         # Adicionales   --------------------
         # --- BA local: más imágenes e iteraciones para mejor consistencia local ---
         # ba_local_num_images=10: incluye más contexto en BA local (default: 6, antes: 8).
-        --Mapper.ba_local_num_images 15
+        --Mapper.ba_local_num_images 6
         # ba_local_max_num_iterations=40: más iteraciones por BA local (default: 25).
         # Con GPU solver el coste extra es marginal (~ms) y mejora convergencia.
         --Mapper.ba_local_max_num_iterations 30
         # ba_local_max_refinements=3: loops de retriangulación+BA local (default: 2).
         # Cada loop refina observaciones. 3 da mejor calidad en transiciones difíciles.
-        --Mapper.ba_local_max_refinements 4
+        --Mapper.ba_local_max_refinements 3
         # --- Perfil mapper relajado para escenas indoor con baja textura ---
         # Menos estricto que antes para priorizar conectividad y reducir fragmentación.
         --Mapper.min_num_matches 15
@@ -989,7 +993,7 @@ if should_run "sparse"; then
         MAPPER_ARGS+=(
             --Mapper.ba_use_gpu 1
             --Mapper.ba_gpu_index 0
-            --Mapper.ba_refine_principal_point 1
+            --Mapper.ba_refine_principal_point 0
             --Mapper.ba_min_num_residuals_for_cpu_multi_threading 50000
         )
     fi
@@ -1139,6 +1143,29 @@ if [ -d "${HOST_DIR}/sparse" ]; then
             echo "   Merge completo: ${MERGE_COUNT} fusionados, ${MERGE_FAIL} descartados → sparse/merged"
             BEST_SPARSE="${HOST_DIR}/sparse/merged"
 
+            # Recomendado por la FAQ de COLMAP: aplicar un BA global tras model_merger
+            # para mejorar consistencia geométrica antes de aceptar/descartar el merge.
+            echo "   Merge refine     : ejecutando bundle_adjuster global sobre sparse/merged"
+            rm -rf "${HOST_DIR}/sparse/merged_refined"
+            BA_MERGE_ARGS=(
+                --input_path ./sparse/merged
+                --output_path ./sparse/merged_refined
+            )
+            if [ "$USE_GPU" -eq 1 ]; then
+                BA_MERGE_ARGS+=(
+                    --BundleAdjustmentCeres.use_gpu 1
+                    --BundleAdjustmentCeres.gpu_index 0
+                )
+            fi
+            if run_colmap bundle_adjuster "${BA_MERGE_ARGS[@]}"; then
+                rm -rf "${HOST_DIR}/sparse/merged"
+                mv "${HOST_DIR}/sparse/merged_refined" "${HOST_DIR}/sparse/merged"
+                echo "   Merge refine     : OK (sparse/merged actualizado)"
+            else
+                echo "WARN: bundle_adjuster post-merge falló; se evalúa calidad con sparse/merged sin refinar" >&2
+                rm -rf "${HOST_DIR}/sparse/merged_refined"
+            fi
+
             if [ "$MERGE_QUALITY_GUARD" -eq 1 ]; then
                 ANCHOR_REPROJ=$(get_model_reproj_error "./sparse/${ANCHOR_NAME}" || true)
                 MERGED_REPROJ=$(get_model_reproj_error "./sparse/merged" || true)
@@ -1203,18 +1230,12 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
             --image_path ./images \
             --input_path "$BEST_SPARSE_REL" \
             --output_path ./dense/0 \
-            --output_type COLMAP
+            --output_type COLMAP \
+            --max_image_size "${MAX_IMAGE_SIZE}"
     fi
 
     # GEOM_CONSISTENCY controla si patch_match_stereo genera consistency_graphs/.
     # stereo_fusion --input_type geometric requiere esos grafos (write_consistency_graph=1).
-    # El valor viene del parámetro CLI --geom-consistency (default: 1).
-    # 0 = solo pasada fotométrica → más puntos, más ruido en superficies uniformes.
-    if [ "${GEOM_CONSISTENCY}" -eq 1 ]; then
-        WRITE_CONSISTENCY_GRAPH=1
-    else
-        WRITE_CONSISTENCY_GRAPH=0
-    fi
 
     if [ "$FAST_DENSE" -eq 1 ]; then
         # Fast mode: fewer samples/iterations + doubled window step for ~4-5x speedup.
@@ -1226,9 +1247,9 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
             --PatchMatchStereo.num_samples 7
             --PatchMatchStereo.num_iterations 3
             --PatchMatchStereo.geom_consistency "${GEOM_CONSISTENCY}"
-            --PatchMatchStereo.write_consistency_graph "${WRITE_CONSISTENCY_GRAPH}"
+            --PatchMatchStereo.write_consistency_graph "${GEOM_CONSISTENCY}"
             --PatchMatchStereo.filter 1
-            --PatchMatchStereo.window_step 2
+            --PatchMatchStereo.window_radius 3
         )
     else
         # Quality mode (default): full geometric consistency + consistency graphs for fusion.
@@ -1240,16 +1261,19 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "dense"; then
             --PatchMatchStereo.num_samples 15
             --PatchMatchStereo.num_iterations 5
             --PatchMatchStereo.geom_consistency "${GEOM_CONSISTENCY}"
-            --PatchMatchStereo.write_consistency_graph "${WRITE_CONSISTENCY_GRAPH}"
+            --PatchMatchStereo.write_consistency_graph "${GEOM_CONSISTENCY}"
             --PatchMatchStereo.filter 1
             --PatchMatchStereo.filter_min_ncc 0.07
+            --PatchMatchStereo.window_radius 5
+            --PatchMatchStereo.num_threads 20
+            --PatchMatchStereo.ncc_sigma 0.60000002384185791
         )
     fi
 
     if [ "$USE_GPU" -eq 1 ]; then
         # RTX 4000 Ada: 48 SMs, ceil(1200/32)=38 bloques/imagen → óptimo ~5 threads simultáneos.
         # VRAM: 5 × 221 MB datos + 200 MB contexto = ~1.3 GB (de 20 GB disponibles).
-        DENSE_ARGS+=(--PatchMatchStereo.gpu_index 0,0,0,0,0)
+        DENSE_ARGS+=(--PatchMatchStereo.gpu_index -1)
     fi
 
     # Fallback depth bounds: required when some images have no visible sparse points.
@@ -1299,7 +1323,7 @@ if [ "$RUN_DENSE" -eq 1 ] && should_run "fusion"; then
         --input_type "${FUSION_INPUT_TYPE}"
         --output_path ./dense/0/fused.ply
         --StereoFusion.num_threads 12
-        --StereoFusion.max_image_size ${MAX_IMAGE_SIZE}
+      #  --StereoFusion.max_image_size ${MAX_IMAGE_SIZE}
     )
     if [ "$FUSION_USE_CACHE" -eq 1 ]; then
         FUSION_ARGS+=(
