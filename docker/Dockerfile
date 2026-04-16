@@ -27,7 +27,7 @@ RUN apt-get update && \
         libeigen3-dev libopenimageio-dev openimageio-tools \
         libmetis-dev libgoogle-glog-dev libgflags-dev \
         libgtest-dev libgmock-dev libsqlite3-dev libglew-dev \
-        qt6-base-dev libqt6opengl6-dev libqt6openglwidgets6 \
+    qt6-base-dev libqt6opengl6-dev libqt6openglwidgets6 libqt6svg6-dev \
         libcgal-dev libsuitesparse-dev \
         libcurl4-openssl-dev libssl-dev \
         libmkl-full-dev \
@@ -164,7 +164,7 @@ RUN apt-get update && \
         libc6 libomp5 libopengl0 libmetis5 \
         libopenimageio2.4t64 libgcc-s1 libgl1 libglew2.2 \
         libgoogle-glog0v6t64 \
-        libqt6core6 libqt6gui6 libqt6widgets6 libqt6openglwidgets6 \
+        libqt6core6 libqt6gui6 libqt6widgets6 libqt6openglwidgets6 libqt6svg6 \
         libcurl4 libssl3t64 \
         libmkl-locale libmkl-intel-lp64 libmkl-intel-thread libmkl-core \
         python3 python3-pip python3-venv \
