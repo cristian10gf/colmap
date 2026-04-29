@@ -366,13 +366,23 @@ BA_SPARSE_EST_BYTES=$(awk -v n="$BA_GPU_MAX_NUM_IMAGES_DIRECT_SPARSE" 'BEGIN {
 }')
 
 # --- Docker Image Selection ---
-if docker image inspect colmap:latest >/dev/null 2>&1; then
-    COLMAP_IMAGE="colmap:latest"
-else
-    echo "Pulling official COLMAP image..."
-    docker pull colmap/colmap:latest
-    COLMAP_IMAGE="colmap/colmap:latest"
+# Feature/matching/sparse: imagen local compilada desde el Dockerfile del repo.
+# Dense/fusion: imagen oficial de Docker Hub.
+LOCAL_COLMAP_IMAGE="colmap:latest"
+OFFICIAL_COLMAP_IMAGE="colmap/colmap:latest"
+
+if ! docker image inspect "${LOCAL_COLMAP_IMAGE}" >/dev/null 2>&1; then
+    echo "Error: no se encontro la imagen local ${LOCAL_COLMAP_IMAGE}." >&2
+    echo "  Construyela con: preprocesamiento/models/colmap/docker/build.sh" >&2
+    exit 1
 fi
+
+if ! docker image inspect "${OFFICIAL_COLMAP_IMAGE}" >/dev/null 2>&1; then
+    echo "Pulling official COLMAP image..."
+    docker pull "${OFFICIAL_COLMAP_IMAGE}"
+fi
+
+COLMAP_IMAGE="${LOCAL_COLMAP_IMAGE}"
 
 if [ -n "$NUM_CPUS_OVERRIDE" ]; then
     NUM_CPUS="$NUM_CPUS_OVERRIDE"
@@ -425,6 +435,8 @@ echo "======================================================="
 echo " COLMAP Advanced Pipeline"
 echo "  Dataset          : $HOST_DIR"
 echo "  Images           : ${IMAGE_COUNT} (${IMAGE_RESOLUTION})"
+echo "  Image (sparse)   : ${LOCAL_COLMAP_IMAGE}"
+echo "  Image (dense)    : ${OFFICIAL_COLMAP_IMAGE}"
 echo "  PatchMatch VRAM  : ${CACHE_SIZE}GB"
 echo "  Max image size   : ${MAX_IMAGE_SIZE}px"
 echo "  Max features     : ${MAX_FEATURES}"
@@ -957,7 +969,7 @@ if should_run "sparse"; then
         # Adicionales   --------------------
         # --- BA local: más imágenes e iteraciones para mejor consistencia local ---
         # ba_local_num_images=10: incluye más contexto en BA local (default: 6, antes: 8).
-        --Mapper.ba_local_num_images 6
+        --Mapper.ba_local_num_images 8
         # ba_local_max_num_iterations=40: más iteraciones por BA local (default: 25).
         # Con GPU solver el coste extra es marginal (~ms) y mejora convergencia.
         --Mapper.ba_local_max_num_iterations 30
@@ -1206,6 +1218,10 @@ if [ -d "${HOST_DIR}/sparse" ]; then
 fi
 BEST_SPARSE_REL="./sparse/$(basename "$BEST_SPARSE")"
 echo "   Sparse model: $BEST_SPARSE_REL"
+if [ "$RUN_DENSE" -eq 1 ]; then
+    COLMAP_IMAGE="${OFFICIAL_COLMAP_IMAGE}"
+    echo "   Imagen COLMAP   : ${COLMAP_IMAGE} (dense/fusion)"
+fi
 
 # =============================================
 # STAGE 4: Dense -- PatchMatch Stereo
